@@ -1,0 +1,396 @@
+﻿ChangeLog for S3FS
+------------------
+
+Version 1.83 -- Dec 17, 2017
+#606 - Add Homebrew instructions
+#608 - Fix chown_nocopy losing existing uid/gid if unspecified
+#609 - Group permission checks sometimes fail with large number of groups
+#611 - Fixed clock_gettime build failure on macOS 10.12 Sierra - #600
+#621 - Upgrade to S3Proxy 1.5.3
+#627 - Update README.md
+#630 - Added travis test on osx for #601
+#631 - Merged macosx branch into master branch #601
+#636 - Fix intermittent upload failures on macOS
+#637 - Add blurb about non-Amazon S3 implementations
+#638 - Minor fixes to README
+#639 - Update Homebrew instructions
+#642 - Fixed potential atomic violation in S3fsCurl::AddUserAgent - #633
+#644 - Fixed with unnecessary equal in POST uploads url argment - #643
+#645 - Configure S3Proxy for SSL
+#646 - Simplify S3Proxy PID handling
+#652 - Fix s3fs_init message
+#659 - Do not fail updating directory when removing old-style object(ref #658)
+#660 - Refixed s3fs_init message(ref #652)
+#663 - Lock FdEntity when mutating orgmeta
+#664 - auth headers insertion refactoring
+#668 - Changed .travis.yml for fixing not found gpg2 on osx
+#669 - add IBM IAM authentication support
+#670 - Fixed a bug in S3fsCurl::LocateBundle
+#671 - Add support for ECS metadata endpoint
+#675 - Reduce use of preprocessor
+#676 - Move str definition from header to implementation
+#677 - Add s3proxy to .gitignore
+#679 - README.md Addition
+#681 - Changed functions about reading passwd file
+#684 - Correct signedness warning
+#686 - remove use of jsoncpp
+#688 - Improved use of temporary files - #678
+#690 - Added option ecs description to man page
+#692 - Updated template md files for issue and pr
+#695 - fix condition for parallel download
+#697 - Fixing race condition in FdEntity::GetStats
+#699 - Fix dbglevel usage
+
+Version 1.82 -- May 13, 2017
+#597 - Not fallback to HTTP - #596
+#598 - Updated ChangeLog and configure.ac for release 1.82
+
+Version 1.81 -- May 13, 2017
+#426 - Updated to correct ChangeLog
+#431 - fix typo s/controll/control/
+#432 - Include location constraint when creating bucket
+#433 - Correct search and replace typo
+#440 - Handled all curl error without exiting process - #437
+#443 - Fix for leaks during stat cache entry expiry / truncation (#340)
+#444 - Add mirror file logic for removing cache file
+#447 - added fuse package for mounting via /etc/fstab, fixes #417
+#449 - Accept mount options compatible with mtab
+#451 - Correct path in README
+#454 - Changed for accepting mount options compatible with mtab - #449
+#466 - Fixed a bug about could not copy file mode from org file
+#471 - Added use_xattr option for #467 and #460
+#477 - OS-specific correspondence of the extended attribute header
+#483 - Trim symbolic link original path in file
+#487 - Split header debugging onto multiple lines for easier reading
+#488 - Fixed searching Content-Length without case sensitive - #480
+#489 - Changed headers_t map using nocase compare function - #488
+#494 - Fix typo s/destroied/destroyed/
+#495 - Fix invalid V4 signature on multipart copy requests
+#498 - Upgrade to S3Proxy 1.5.1
+#502 - Fixed issue#435 branch codes for remaining bugs(2)
+#503 - Add missing call to mtime test
+#504 - Use describe helper function
+#505 - Correct typos
+#509 - Use server-provided ETag during complete upload
+#511 - Fixed a bug about uploading NULL to some part of the file contents
+#512 - Changed clock_gettime func to s3fs_clock_gettime for homebrew - #468
+#513 - Added issue and PR templates.
+#517 - Update s3fs.1 - removed duplicated word
+#520 - Added links for eventual consistency in README.md - #515
+#539 - Upgrade to S3Proxy 1.5.2
+#540 - Address cppcheck 1.77 warnings
+#545 - Changed base cached time of stat_cache_expire option - #523
+#546 - Fixed double initialization of SSL library at foreground
+#550 - Add umount instruction for unplivileged user
+#551 - Updated stat_cache_expire option description - #545
+#552 - switch S3fsMultiCurl to use foreground threads
+#553 - add TLS cipher suites customization
+#554 - cleanup cache directory when running out of disk space
+#555 - don't sign empty headers (as they are discarded
+#556 - fix multipart upload handling without cache
+#557 - Added check_cache_dir_exist option(refixed #347) - #538
+#558 - Fixed a bug in logic about truncating stat cache
+#560 - Fixed about multipart uploading at no free space related to #509
+#567 - Do not send ACL unless overridden
+#576 - Added option for complementing lack of stat mode
+#578 - Refactored the get_object_attribute function
+#579 - Added notsup_compat_dir option
+#580 - Enhanced bucket/path parameter check
+#582 - Check errors returned in 200 OK responses for put header request
+#583 - Updated limit object size in s3fs man page
+#585 - Fixed failure to upload/copy with SSE_C and SSE_KMS
+#587 - Changed copyright year format for debian pkg
+#588 - Default transport to HTTPS
+#590 - Updated man page for default_acl option - #567
+#593 - Backward compatible for changing default transport to HTTPS
+#594 - Check bucket at public bucket and add nocopyapi option automatically
+#595 - Updated ChangeLog and configure.ac for release 1.81
+
+Version 1.80 -- May 29, 2016
+#213 - Parse ETag from copy multipart correctly
+#215 - Fix mem leak in openssl_auth.cpp:s3fs_sha256hexsum
+#217 - Override install, so that the make install does not install rename_before_close under /test
+#219 - Address Coverity errors
+#220 - Test removing a non-empty directory
+#221 - Compare idiomatically
+#222 - Annotate constructors as explicit
+#224 - Configure cppcheck
+#229 - Convert rename_before_close to a shell script
+#231 - Rewrite AutoLock
+#232 - Always hold stat_cache_lock when using stat_cache
+#233 - Remove IntToStr
+#234 - Update README
+#235 - Plug leak during complete multipart upload
+#237 - Refactor tests into individual functions
+#238 - Enable all cppcheck rules
+#239 - Update stale Google Code reference in --help
+#240 - Enable Content-MD5 during multipart upload part
+#243 - Run cppcheck during Travis builds
+#245 - Elide duplicate lookups of std::map via iterators
+#246 - Unlock during early return in TruncateCache
+#247 - Base64 cleanup
+#248 - Enable integration tests for Travis
+#249 - Silence wget
+#250 - s3fs can print version with short commit hash - #228
+#251 - Skip xattr tests if utilities are missing
+#252 - This fixes an issue with caching when the creation of a subdirectory …
+#253 - Added chacking cache dir perms at starting.
+#256 - Add no atomic rename to limitations
+#257 - Update README.md: Bugfix password file permissions errors
+#258 - Update README.md to better explain mount upon boot
+#260 - Wrap help text at 80 characters
+#261 - Correct help timeouts
+#263 - Allow integration testing against Amazon S3
+#265 - Fix integration tests
+#266 - Cleanup from PR #265
+#267 - Added the _netdev option to the fstab example.
+#268 - Use 127.0.0.1 not localhost in s3proxy wait loop
+#271 - Add support for standard_ia storage class
+#274 - Modified man page for storage_class option(#271)
+#275 - Changed and cleaned the logic for debug message.
+#278 - Supported for SSE KMS(#270)
+#280 - Supported a object which is larger than free disk space
+#285 - Add test for symlink
+#288 - Fixed a bug about head request(copy) for SSE - issue#286
+#289 - Print source file in log messages
+#291 - File opened with O_TRUNC is not flushed - Issue #290
+#293 - Fix a small spelling issue.
+#295 - File opened with O_TRUNC is not flushed - changed #291
+#300 - Update integration-test-main.sh
+#302 - Fix syslog level used by S3FS_PRN_EXIT()
+#304 - Fixed a bug about mtime - #299
+#306 - Fix read concurrency to work in parallel count
+#307 - Fix pthread portability problem
+#308 - Changed ensure free disk space as additional change for #306
+#309 - Check pthread prtability in configure as additional change for #307
+#310 - Update integration-test-main.sh as additional change for #300
+#311 - Change error log to debug log in s3fs_read()
+#313 - fix gitignore
+#319 - Clean up mount point on errors in s3fs_init()
+#321 - delete stat cache entry in s3fs_fsync so st_size is refreshed - #320
+#323 - Add goofys to references
+#328 - Fix v4 signature with use_path_request_style
+#329 - Correct multiple issues with GET and v4 signing
+#330 - Pass by const reference where possible
+#331 - Address various clang warnings
+#334 - Bucket host should include port and not path
+#336 - update REAME.md for fstab
+#338 - Fixed a bug about IAMCRED type could not be retried.
+#339 - Updated README.md for fstab example.
+#341 - Fix the memory leak issue in fdcache.
+#346 - Fix empty directory check against AWS S3
+#348 - Integration test summary, continue on error
+#350 - Changed cache out logic for stat - #340
+#351 - Check cache dirctory path and attributes - #347
+#352 - Remove stat file cache dir if specified del_cache - #337
+#354 - Supported regex type for additional header format - #343
+#355 - Fixed codes about clock_gettime for osx
+#356 - Fixed codes about clock_gettime for osx(2)
+#357 - Fixed codes about clock_gettime for osx(3)
+#359 - Remove optional parameter from Content-Type header - #358
+#360 - Fix clock_gettime autotools detection on Linux
+#364 - Checked content-type by no case-sensitivity - #363
+#371 - Always set stats cache for opened file
+#372 - Fixed a bug about etag comparison in stats cache, etc.
+#376 - Test for writing after an lseek past end of file
+#379 - Fixed a bug about writing sparsed file - #375
+#385 - fix typo in curl.cpp: s/returing/returning/
+#391 - Update s3fs.1
+#394 - Revert "Fixed a bug about writing sparsed file - #375"
+#395 - Fixed writing sparsed file - #375,#379,#394
+#397 - Supported User-Agent header - #383
+#403 - Fix a bug of truncating empty file
+#404 - Add curl handler pool to reuse connections
+#409 - Fixed 'load_sse_c' option not working - #388
+#410 - Allow duplicate key in ahbe_conf - #386
+#411 - loading IAM role name automatically(iam_role option) - #387
+#415 - Fixed a bug about stat_cache_expire - #382
+#420 - Skip early credential checks when iam_role=auto
+#422 - Fixes for iam_role=auto
+#424 - Added travis CI badge in README.md
+#425 - Updated ChangeLog and configure.ac for release 1.80
+
+Version 1.79 -- Jul 19, 2015
+issue #60 - Emit user-friendly log messages on failed CheckBucket requests
+issue #62 - Remove stray chars from source files
+issue #63 - Fix spelling errors
+issue #68 - FreeBSD issue
+issue #69 - Address clang always true warnings
+issue #73 - Small gitignore fixes
+issue #74 - url: handle scheme omission
+issue #83 - Changed option processing to use strtol() to get a umask
+issue #93 - Add simple unit tests for trim functions
+issue #100 - CURL handles not properly initialized to use DNS or SSL session caching
+issue #101 - Optimized function "bool directory_empty()"
+issue #103 - Remove prefix option in s3fs man page - issue#87
+issue #104 - fix rename before close
+issue #116 - Supported signature version 4
+issue #119 - Added new mp_umask option about issue#107, pr#110
+issue #124 - Fallback to v2 signatures correctly.
+issue #130 - refactor integration tests create/cleanup file
+issue #131 - Test ls
+issue #132 - Use S3Proxy to run integration tests
+issue #134 - Include Content-Type in complete MPU V2 signature
+issue #135 - Correct V4 signature for initiate multipart upload
+issue #136 - Small fixes to integration tests
+issue #137 - Add test for multi-part upload
+issue #138 - Fixed bugs, not turn use_cache off and ty to load to end - issue#97
+issue #143 - Fixed a bug no use_cache case about fixed #138 - issue#141
+issue #144 - Add Travis configuration
+issue #146 - add exit handler to cleanup on failures
+issue #147 - Use S3Proxy 1.4.0-SNAPSHOT
+issue #150 - Fixed a bug not handling fsync - #145
+issue #154 - Fixed url-encoding for ampersand etc on sigv4 - Improvement/#149
+issue #155 - Fixed a bug: unable to mount bucket subdirectory
+issue #156 - Fixed a bug about ssl session sharing with libcurl older 7.23.0 - issue#126
+issue #159 - Upgrade to S3Proxy 1.4.0
+issue #164 - send the correct Host header when using -o url
+issue #165 - Auth v4 refactor
+issue #167 - Increased default connecting/reading/writing timeout value
+issue #168 - switch to use region specific endpoints to compute correct v4 signature
+issue #170 - Reviewed and fixed response codes print in curl.cpp - #157
+issue #171 - Support buckets with mixed-case names
+issue #173 - Run integration tests via Travis
+issue #176 - configure.ac: detect target, if target is darwin (OSX), then #176
+issue #177 - Add .mailmap
+issue #178 - Update .gitignore
+issue #184 - Add usage information for multipart_size
+issue #185 - Correct obvious typos in usage and README
+issue #190 - Add a no_check_certificate option.
+issue #194 - Tilda in a file-name breaks things (EPERM)
+issue #198 - Disasble integration tests for Travis 
+issue #199 - Supported extended attributes(retry)
+issue #200 - fixed fallback to sigv2 for bucket create and GCS
+issue #202 - Specialize {set,get}xattr for OS X
+issue #204 - Add integration test for xattr
+issue #207 - Fixed a few small spelling issues.
+
+Version 1.78 -- Sep 15, 2014
+issue #29 - Possible to create Debian/Ubuntu packages?(googlecode issue 109)
+issue 417(googlecode) - Password file with DOS format is not handled properly
+issue #41 - Failed making signature
+issue #40 - Moving a directory containing more than 1000 files truncates the directory
+issue #49 - use_sse is ignored when creating new files
+issue #39 - Support for SSE-C
+issue #50 - Cannot find pkg-config when configured with any SSL backend except openssl
+
+Version 1.77 -- Apr 19, 2014
+issue 405(googlecode) - enable_content_md5 Input/output error
+issue #14 - s3fs -u should return 0 if there are no lost multiparts
+issue #16 - empty file is written to s3
+issue #18 - s3fs crashes with segfault
+issue #22 - Fix typos in docs for max_stat_cache_size
+issue #23 - curl ssl problems
+issue #28 - Address signedness warning in FdCache::Init
+
+Version 1.76 -- Jan 21, 2014
+issue #5 - du shows incorrect usage stats
+issue #8 - version in configure.ac is 1.74 for release 1.75
+
+Version 1.75 -- Jan 6, 2014
+issue #1 - Using %20 instead of the plus (+) sign for encoding spaces
+issue #3 - Fixed local timezone was incorrectly being applied to IAM and Last-Modified dates.
+issue #4 - Fix compilation error on MacOSX with missing const
+
+Version 1.74 -- Nov 24, 2013
+This version is initial version on Github, same as on GoogleCodes(s3fs).
+https://github.com/s3fs-fuse/s3fs-fuse/releases/tag/v1.74
+see more detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.74.tar.gz
+
+Version 1.73 -- Aug 23, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.73.tar.gz
+
+Version 1.72 -- Aug 10, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.72.tar.gz
+
+Version 1.71 -- Jun 15, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.71.tar.gz
+
+Version 1.70 -- Jun 01, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.70.tar.gz
+
+Version 1.69 -- May 15, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.69.tar.gz
+
+Version 1.68 -- Apr 30, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.68.tar.gz
+
+Version 1.67 -- Apr 13, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.67.tar.gz
+
+Version 1.66 -- Apr 06, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.66.tar.gz
+
+Version 1.65 -- Mar 30, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.65.tar.gz
+
+Version 1.64 -- Mar 23, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.64.tar.gz
+
+Version 1.63 -- Feb 24, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.63.tar.gz
+
+Version 1.62 -- Jan 27, 2013
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.62.tar.gz
+
+Version 1.61 -- Aug 30, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.61.tar.gz
+
+Version 1.60 -- Aug 29, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.60.tar.gz
+
+Version 1.59 -- Jul 28, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.59.tar.gz
+
+Version 1.58 -- Jul 19, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.58.tar.gz
+
+Version 1.57 -- Jul 07, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.57.tar.gz
+
+Version 1.56 -- Jul 07, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.56.tar.gz
+
+Version 1.55 -- Jul 02, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.55.tar.gz
+
+Version 1.54 -- Jun 25, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.54.tar.gz
+
+Version 1.53 -- Jun 22, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.53.tar.gz
+
+Version 1.40 -- Feb 11, 2011
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.40.tar.gz
+
+Version 1.33 -- Dec 30, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.33.tar.gz
+
+Version 1.25 -- Dec 16, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.25.tar.gz
+
+Version 1.19 -- Dec 2, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.19.tar.gz
+
+Version 1.16 -- Nov 22, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.16.tar.gz
+
+Version 1.10 -- Nov 6, 2010 
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.10.tar.gz
+
+Version 1.02 -- Oct 29, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.02.tar.gz
+
+Version 1.01 -- Oct 28, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.01.tar.gz
+
+Version 1.0  -- Oct 24, 2010
+see detail on googlecodes: http://code.google.com/p/s3fs/downloads/detail?name=s3fs-1.0.tar.gz
+
+------
+Version 1.1 -- Mon Oct 18 2010
+Dan Moore reopens the project and fixes various issues that had accumulated in the tracker. Adrian Petrescu converts the project to autotools and posts it to GitHub.
+
+Version 1.0 -- 2008
+Randy Rizun releases a basic version of S3FS on Google Code.
+
