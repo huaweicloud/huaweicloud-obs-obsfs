@@ -5,6 +5,7 @@
 
 #define HWS_CONFIG_VALUE_STR_LEN  128
 #define HWS_CONFIG_INVALID_VALUE -1
+#define OBSFS_LOG_MODE_SET_DELAY_MS  5000 /*obs fs log mode set 5000 ms after start*/
 
 extern void hws_configure_task();
 
@@ -15,6 +16,7 @@ typedef enum
     HWS_CFG_STAT_PRINT_SECONDS,
     HWS_CFG_STAT_PRINT_COUNT,
     HWS_CFG_CACHE_ASSERT,
+    HWS_CFG_COULDNT_RESOLVE_HOST,
     HWS_CFG_INT_END
 } HwsConfigIntEnum;
 

@@ -48,7 +48,7 @@ using namespace std;
 typedef struct dht_view_version_info{
     int maxDhtViewVersion;
     pthread_spinlock_t maxDhtViewVersionLock;
-    
+
     int curDhtViewVersion;
     time_t curDhtViewVersionUpdateTime;
     pthread_spinlock_t curDhtViewVersionLock;
@@ -78,367 +78,58 @@ string get_realpath(const char *path) {
   return realpath;
 }
 
+/* file gateway modify begin */
 //-------------------------------------------------------------------
 // Class S3ObjList
 //-------------------------------------------------------------------
-// New class S3ObjList is base on old s3_object struct.
-// This class is for S3 compatible clients.
-//
-// If name is terminated by "/", it is forced dir type.
-// If name is terminated by "_$folder$", it is forced dir type.
-// If is_dir is true and name is not terminated by "/", the name is added "/".
-//
-bool S3ObjList::insert(const char* name, const char* etag, bool is_dir)
-{
-  if(!name || '\0' == name[0]){
+bool S3ObjList::insert(const std::string name, bool is_dir){
+  if(name.empty()){
+    // Ignore empty name.
     return false;
   }
 
-  s3obj_t::iterator iter;
-  string newname;
-  string orgname = name;
-
-  // Normalization
-  string::size_type pos = orgname.find("_$folder$");
-  if(string::npos != pos){
-    newname = orgname.substr(0, pos);
-    is_dir  = true;
-  }else{
-    newname = orgname;
+  // Normalize the key name.
+  string key_name = name;
+  if('/' == name[name.length() - 1]){
+    // A name terminated by "/" is forced dir type.
+    is_dir = true;
+    // Remove the tail '/' of the name of direcotry.
+    key_name = name.substr(0, name.length() - 1);
   }
+
+  // Normalize the value name.
+  string value_name = key_name;
   if(is_dir){
-    if('/' != newname[newname.length() - 1]){
-      newname += "/";
-    }
-  }else{
-    if('/' == newname[newname.length() - 1]){
-      is_dir = true;
-    }
+    // Forced the name of direcotry tailed by '/'.
+    value_name += "/";
   }
 
-  // Check derived name object.
-  if(is_dir){
-    string chkname = newname.substr(0, newname.length() - 1);
-    if(objects.end() != (iter = objects.find(chkname))){
-      // found "dir" object --> remove it.
-      objects.erase(iter);
-    }
-  }else{
-    string chkname = newname + "/";
-    if(objects.end() != (iter = objects.find(chkname))){
-      // found "dir/" object --> not add new object.
-      // and add normalization
-      return insert_normalized(orgname.c_str(), chkname.c_str(), true);
-    }
-  }
-
-  // Add object
-  if(objects.end() != (iter = objects.find(newname))){
-    // Found same object --> update information.
-    (*iter).second.normalname.erase();
-    (*iter).second.orgname = orgname;
-    (*iter).second.is_dir  = is_dir;
-    if(etag){
-      (*iter).second.etag = string(etag);  // over write
-    }
-  }else{
-    // add new object
-    s3obj_entry newobject;
-    newobject.orgname = orgname;
-    newobject.is_dir  = is_dir;
-    if(etag){
-      newobject.etag = etag;
-    }
-    objects[newname] = newobject;
-  }
-
-  // add normalization
-  return insert_normalized(orgname.c_str(), newname.c_str(), is_dir);
-}
-
-bool S3ObjList::insert_normalized(const char* name, const char* normalized, bool is_dir)
-{
-  if(!name || '\0' == name[0] || !normalized || '\0' == normalized[0]){
-    return false;
-  }
-  if(0 == strcmp(name, normalized)){
-    return true;
-  }
-
-  s3obj_t::iterator iter;
-  if(objects.end() != (iter = objects.find(name))){
-    // found name --> over write
-    (*iter).second.orgname.erase();
-    (*iter).second.etag.erase();
-    (*iter).second.normalname = normalized;
-    (*iter).second.is_dir     = is_dir;
-  }else{
-    // not found --> add new object
-    s3obj_entry newobject;
-    newobject.normalname = normalized;
-    newobject.is_dir     = is_dir;
-    objects[name]        = newobject;
-  }
+  // Insert the name into map.
+  objects.insert(pair<string,string>(key_name, value_name));
   return true;
 }
 
-const s3obj_entry* S3ObjList::GetS3Obj(const char* name) const
-{
-  s3obj_t::const_iterator iter;
-
-  if(!name || '\0' == name[0]){
-    return NULL;
+std::string S3ObjList::get_last_name() const {
+  if(empty()){
+    return std::string("");
   }
-  if(objects.end() == (iter = objects.find(name))){
-    return NULL;
+  std::string last = objects.rbegin()->second;
+  if(last.empty() || ('/' != last[last.length()-1])){
+    return last;
   }
-  return &((*iter).second);
+  return last.substr(0, last.length()-1);
 }
 
-string S3ObjList::GetOrgName(const char* name) const
-{
-  const s3obj_entry* ps3obj;
-
-  if(!name || '\0' == name[0]){
-    return string("");
+S3ObjListStatistic S3ObjList::get_statistic() const {
+  S3ObjListStatistic list_info;
+  if(!empty()){
+    list_info.set_size(objects.size());
+    list_info.set_first(objects.begin()->second);
+    list_info.set_last(objects.rbegin()->second);
   }
-  if(NULL == (ps3obj = GetS3Obj(name))){
-    return string("");
-  }
-  return ps3obj->orgname;
+  return list_info;
 }
-
-string S3ObjList::GetNormalizedName(const char* name) const
-{
-  const s3obj_entry* ps3obj;
-
-  if(!name || '\0' == name[0]){
-    return string("");
-  }
-  if(NULL == (ps3obj = GetS3Obj(name))){
-    return string("");
-  }
-  if(0 == (ps3obj->normalname).length()){
-    return string(name);
-  }
-  return ps3obj->normalname;
-}
-
-string S3ObjList::GetETag(const char* name) const
-{
-  const s3obj_entry* ps3obj;
-
-  if(!name || '\0' == name[0]){
-    return string("");
-  }
-  if(NULL == (ps3obj = GetS3Obj(name))){
-    return string("");
-  }
-  return ps3obj->etag;
-}
-
-bool S3ObjList::IsDir(const char* name) const
-{
-  const s3obj_entry* ps3obj;
-
-  if(NULL == (ps3obj = GetS3Obj(name))){
-    return false;
-  }
-  return ps3obj->is_dir;
-}
-
-bool S3ObjList::GetLastName(std::string& lastname) const
-{
-  bool result = false;
-  lastname = "";
-  for(s3obj_t::const_iterator iter = objects.begin(); iter != objects.end(); ++iter){
-    if((*iter).second.orgname.length()){
-      if(0 > strcmp(lastname.c_str(), (*iter).second.orgname.c_str())){
-        lastname = (*iter).second.orgname;
-        result = true;
-      }
-    }else{
-      if(0 > strcmp(lastname.c_str(), (*iter).second.normalname.c_str())){
-        lastname = (*iter).second.normalname;
-        result = true;
-      }
-    }
-  }
-  return result;
-}
-
-bool S3ObjList::GetNameList(s3obj_list_t& list, bool OnlyNormalized, bool CutSlash) const
-{
-  s3obj_t::const_iterator iter;
-
-  for(iter = objects.begin(); objects.end() != iter; ++iter){
-    if(OnlyNormalized && 0 != (*iter).second.normalname.length()){
-      continue;
-    }
-    string name = (*iter).first;
-    if(CutSlash && 1 < name.length() && '/' == name[name.length() - 1]){
-      // only "/" string is skio this.
-      name = name.substr(0, name.length() - 1);
-    }
-    list.push_back(name);
-  }
-  return true;
-}
-
-typedef std::map<std::string, bool> s3obj_h_t;
-
-bool S3ObjList::MakeHierarchizedList(s3obj_list_t& list, bool haveSlash)
-{
-  s3obj_h_t h_map;
-  s3obj_h_t::iterator hiter;
-  s3obj_list_t::const_iterator liter;
-
-  for(liter = list.begin(); list.end() != liter; ++liter){
-    string strtmp = (*liter);
-    if(1 < strtmp.length() && '/' == strtmp[strtmp.length() - 1]){
-      strtmp = strtmp.substr(0, strtmp.length() - 1);
-    }
-    h_map[strtmp] = true;
-
-    // check hierarchized directory
-    for(string::size_type pos = strtmp.find_last_of("/"); string::npos != pos; pos = strtmp.find_last_of("/")){
-      strtmp = strtmp.substr(0, pos);
-      if(0 == strtmp.length() || "/" == strtmp){
-        break;
-      }
-      if(h_map.end() == h_map.find(strtmp)){
-        // not found
-        h_map[strtmp] = false;
-      }
-    }
-  }
-
-  // check map and add lost hierarchized directory.
-  for(hiter = h_map.begin(); hiter != h_map.end(); ++hiter){
-    if(false == (*hiter).second){
-      // add hierarchized directory.
-      string strtmp = (*hiter).first;
-      if(haveSlash){
-        strtmp += "/";
-      }
-      list.push_back(strtmp);
-    }
-  }
-  return true;
-}
-
-//-------------------------------------------------------------------
-// Utility functions for moving objects
-//-------------------------------------------------------------------
-MVNODE *create_mvnode(const char *old_path, const char *new_path, bool is_dir, bool normdir)
-{
-  MVNODE *p;
-  char *p_old_path;
-  char *p_new_path;
-
-  p = (MVNODE *) malloc(sizeof(MVNODE));
-  if (p == NULL) {
-    printf("create_mvnode: could not allocation memory for p\n");
-    S3FS_FUSE_EXIT();
-    return NULL;
-  }
-
-  if(NULL == (p_old_path = strdup(old_path))){
-    free(p);
-    printf("create_mvnode: could not allocation memory for p_old_path\n");
-    S3FS_FUSE_EXIT();
-    return NULL;
-  }
-
-  if(NULL == (p_new_path = strdup(new_path))){
-    free(p);
-    free(p_old_path);
-    printf("create_mvnode: could not allocation memory for p_new_path\n");
-    S3FS_FUSE_EXIT();
-    return NULL;
-  }
-
-  p->old_path   = p_old_path;
-  p->new_path   = p_new_path;
-  p->is_dir     = is_dir;
-  p->is_normdir = normdir;
-  p->prev = NULL;
-  p->next = NULL;
-  return p;
-}
-
-//
-// Add sorted MVNODE data(Ascending order)
-//
-MVNODE *add_mvnode(MVNODE** head, MVNODE** tail, const char *old_path, const char *new_path, bool is_dir, bool normdir)
-{
-  if(!head || !tail){
-    return NULL;
-  }
-
-  MVNODE* cur;
-  MVNODE* mvnew;
-  for(cur = *head; cur; cur = cur->next){
-    if(cur->is_dir == is_dir){
-      int nResult = strcmp(cur->old_path, old_path);
-      if(0 == nResult){
-        // Found same old_path.
-        return cur;
-
-      }else if(0 > nResult){
-        // next check.
-        // ex: cur("abc"), mvnew("abcd")
-        // ex: cur("abc"), mvnew("abd")
-        continue;
-
-      }else{
-        // Add into before cur-pos.
-        // ex: cur("abc"), mvnew("ab")
-        // ex: cur("abc"), mvnew("abb")
-        if(NULL == (mvnew = create_mvnode(old_path, new_path, is_dir, normdir))){
-          return NULL;
-        }
-        if(cur->prev){
-          (cur->prev)->next = mvnew;
-        }else{
-          *head = mvnew;
-        }
-        mvnew->prev = cur->prev;
-        mvnew->next = cur;
-        cur->prev = mvnew;
-
-        return mvnew;
-      }
-    }
-  }
-  // Add into tail.
-  if(NULL == (mvnew = create_mvnode(old_path, new_path, is_dir, normdir))){
-    return NULL;
-  }
-  mvnew->prev = (*tail);
-  if(*tail){
-    (*tail)->next = mvnew;
-  }
-  (*tail) = mvnew;
-  if(!(*head)){
-    (*head) = mvnew;
-  }
-  return mvnew;
-}
-
-void free_mvnodes(MVNODE *head)
-{
-  MVNODE *my_head;
-  MVNODE *next;
-
-  for(my_head = head, next = NULL; my_head; my_head = next){
-    next = my_head->next;
-    free(my_head->old_path);
-    free(my_head->new_path);
-    free(my_head);
-  }
-  return;
-}
+/* file gateway modify end */
 
 //-------------------------------------------------------------------
 // Class AutoLock
@@ -1325,12 +1016,12 @@ void show_help (void)
 void show_version(void)
 {
   printf(
-  "Amazon Simple Storage Service File System V%s(commit:%s) with %s\n"
-  "Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>\n"
+  "Huawei Object Storage Service File System V1.0.1(commit:%s) with %s\n"
+  "Copyright (C) 2019 Huawei Technologies Co. Ltd <support@huawei.com>\n"
   "License GPL2: GNU GPL version 2 <http://gnu.org/licenses/gpl.html>\n"
   "This is free software: you are free to change and redistribute it.\n"
   "There is NO WARRANTY, to the extent permitted by law.\n",
-  VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name());
+  COMMIT_HASH_VAL, s3fs_crypt_lib_name());
   return;
 }
 

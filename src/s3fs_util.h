@@ -24,25 +24,55 @@
 #include <string>
 #include <sstream>
 #include <list>
-/* file gateway modify end */
 
-//-------------------------------------------------------------------
-// Typedef
-//-------------------------------------------------------------------
-//
-// Struct
-//
-struct s3obj_entry{
-  std::string normalname; // normalized name: if empty, object is normalized name.
-  std::string orgname;    // original name: if empty, object is original name.
-  std::string etag;
-  bool        is_dir;
+template<typename T> std::string toString(const T& t){
+    std::ostringstream oss;  //创建一个格式化输出流
+    oss<<t;             //把值传递如流中
+    return oss.str();
+}
 
-  s3obj_entry() : is_dir(false) {}
+/* file gateway modify begin */
+class S3ObjListStatistic{
+private:
+  size_t size_;
+  std::string first_;
+  std::string last_;
+
+public:
+  S3ObjListStatistic() : size_(0),first_(""),last_("") {}
+  ~S3ObjListStatistic() {}
+
+  size_t get_size() const { return size_; }
+  void set_size(size_t size) { size_ = size; }
+  const std::string& get_first() const { return first_; }
+  void set_first(const std::string& name) { first_ = name; }
+  const std::string& get_last() const { return last_; }
+  void set_last(const std::string& name) { last_ = name; }
+
+  std::string to_string() {
+    return std::string("(cnt:") + toString(size_)
+                     + ",first:" + first_
+                     + ",last:" + last_ + ")";
+  }
+
+  // increase the count and update first name or last name.
+  void update(const std::string& name)
+  {
+    size_++;
+    if(first_.empty()){
+      first_ = name;
+    }
+    last_ = name;
+  }
+
+  // get the last name without tail '/'.
+  std::string get_last_name() const {
+    if(last_.empty() || ('/' != last_[last_.length()-1])){
+      return last_;
+    }
+    return last_.substr(0, last_.length()-1);
+  }
 };
-
-typedef std::map<std::string, struct s3obj_entry> s3obj_t;
-typedef std::list<std::string> s3obj_list_t;
 
 //
 // Class
@@ -50,45 +80,29 @@ typedef std::list<std::string> s3obj_list_t;
 class S3ObjList
 {
   private:
-    s3obj_t objects;
-
-  private:
-    bool insert_normalized(const char* name, const char* normalized, bool is_dir);
-    const s3obj_entry* GetS3Obj(const char* name) const;
-
-    s3obj_t::const_iterator begin(void) const {
-      return objects.begin();
-    }
-    s3obj_t::const_iterator end(void) const {
-      return objects.end();
-    }
+    // The map must keep the same sort rules with the OBS.
+    // 1) The key name for direcotry isn't tailed by '/' and the default sort method (by dictionary) is OK.
+    // 2) The value name for direcotry is tailed by '/'
+    typedef std::map<std::string,std::string> s3obj_map_t;
+    s3obj_map_t objects;
 
   public:
     S3ObjList() {}
     ~S3ObjList() {}
 
-    bool IsEmpty(void) const {
-      return objects.empty();
+    s3obj_map_t::const_iterator begin(void) const {
+      return objects.begin();
     }
-    bool insert(const char* name, const char* etag = NULL, bool is_dir = false);
-    std::string GetOrgName(const char* name) const;
-    std::string GetNormalizedName(const char* name) const;
-    std::string GetETag(const char* name) const;
-    bool IsDir(const char* name) const;
-    bool GetNameList(s3obj_list_t& list, bool OnlyNormalized = true, bool CutSlash = true) const;
-    bool GetLastName(std::string& lastname) const;
-
-    static bool MakeHierarchizedList(s3obj_list_t& list, bool haveSlash);
+    s3obj_map_t::const_iterator end(void) const {
+      return objects.end();
+    }
+    bool empty() const { return objects.empty(); }
+    size_t size() const { return objects.size(); }
+    bool insert(const std::string name, bool is_dir);
+    std::string get_last_name() const;
+    S3ObjListStatistic get_statistic() const;
 };
-
-typedef struct mvnode {
-   char *old_path;
-   char *new_path;
-   bool is_dir;
-   bool is_normdir;
-   struct mvnode *prev;
-   struct mvnode *next;
-} MVNODE;
+/* file gateway modify end */
 
 class AutoLock
 {
@@ -106,18 +120,6 @@ class AutoLock
 // Functions
 //-------------------------------------------------------------------
 std::string get_realpath(const char *path);
-
-/* file gateway modify begin */
-template<typename T> std::string toString(const T& t){
-    std::ostringstream oss;  //创建一个格式化输出流
-    oss<<t;             //把值传递如流中
-    return oss.str();
-}
-/* file gateway modify end */
-
-MVNODE *create_mvnode(const char *old_path, const char *new_path, bool is_dir, bool normdir = false);
-MVNODE *add_mvnode(MVNODE** head, MVNODE** tail, const char *old_path, const char *new_path, bool is_dir, bool normdir = false);
-void free_mvnodes(MVNODE *head);
 
 std::string get_username(uid_t uid);
 int is_uid_include_group(uid_t uid, gid_t gid);

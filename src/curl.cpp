@@ -53,11 +53,16 @@
 
 /* file gateway modify begin */
 #include "hws_s3fs_statis_api.h"
+#include "hws_configure.h"
 /* file gateway modify end */
 
 using namespace std;
 
 static const std::string empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/* file gateway modify begin */
+extern int gCliCannotResolveRetryCount;
+/* file gateway modify end */
+
 
 //-------------------------------------------------------------------
 // Utilities
@@ -2284,9 +2289,21 @@ int S3fsCurl::RequestPerform(void)
     curl_easy_getinfo(hCurl, CURLINFO_EFFECTIVE_URL , &ptr_url);
     S3FS_PRN_DBG("connecting to URL %s", SAFESTRPTR(ptr_url));
   }
-
+  
+  //sleep init seconds when can not connect
+  int sleepSeconds = 0;
+  int sleepSecondStep = 2;
+  int maxRetryNum = S3fsCurl::retries;
+  
   // 1 attempt + retries...
-  for(int retrycnt = S3fsCurl::retries; 0 < retrycnt; retrycnt--){
+  int retrycnt = 0;
+  while (true)
+  {
+    if (retrycnt >= maxRetryNum)
+    {
+	break;
+    }
+    retrycnt++;
     // Requests
 /* file gateway modify begin */
     timeval begin_tv;
@@ -2362,13 +2379,25 @@ int S3fsCurl::RequestPerform(void)
         break;
 
       case CURLE_COULDNT_RESOLVE_HOST:
-        S3FS_PRN_ERR("### CURLE_COULDNT_RESOLVE_HOST, url: %s", url.c_str());
-        sleep(2);
+        {
+          if(gCliCannotResolveRetryCount > 0)
+          {
+            maxRetryNum = gCliCannotResolveRetryCount;
+          }
+          else
+          {
+            maxRetryNum = HwsGetIntConfigValue(HWS_CFG_COULDNT_RESOLVE_HOST);
+          }
+          S3FS_PRN_ERR("### CURLE_COULDNT_RESOLVE_HOST, url: %s, modify maxRetryNum = %d.", url.c_str(), maxRetryNum);
+          sleep(2);
+        }
         break;
 
       case CURLE_COULDNT_CONNECT:
         S3FS_PRN_ERR("### CURLE_COULDNT_CONNECT, url: %s", url.c_str());
-        sleep(4);
+	//sleep 6 12 18s
+	sleepSeconds = (retrycnt + 1) * 3 * sleepSecondStep;
+        sleep(sleepSeconds);
         break;
 
       case CURLE_GOT_NOTHING:
@@ -2998,7 +3027,7 @@ bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* 
         S3FS_PRN_DBG("PreheadRequest with inode_no and shardkey.");
         string str_inode_no = toString(*inode_no);
         requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_inodeNo, str_inode_no.c_str());
-        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, shardkey);
+        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(shardkey).c_str());
     }
 /* file gateway modify end */
 
@@ -3536,10 +3565,10 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
   }
   string resource;
   string turl;
-  MakeUrlResource(inodeNoStr, resource, turl);
+  path            = "/" + string(inodeNoStr);
+  MakeUrlResource(path.c_str(), resource, turl);
 
   url             = prepare_url(turl.c_str());
-  path            = "/" + string(inodeNoStr);
   S3FS_PRN_DBG("[inodeStr=%s],[turl=%s],[url=%s],[path=%s]", inodeNoStr, turl.c_str(), url.c_str(), path.c_str());
 
   requestHeaders  = NULL;
@@ -3565,7 +3594,7 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
 
   if (0 != strcmp(shardkey, ""))
   {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, shardkey);
+      requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(shardkey).c_str());
   }
 
   op = "GET";
@@ -3674,12 +3703,12 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
     string turl;
     timeval begin_tv;
     //s3fsStatisStart(WRITE_MAKE_CURL_DELAY, &begin_tv);
-    MakeUrlResource(inodeNoStr.c_str(), resource, turl);
+    path            = "/" + inodeNoStr;
+    MakeUrlResource(path.c_str(), resource, turl);
     //MakeRWUrlResource(inodeNoStr, writeparmname.c_str(), offsetStr.c_str(), resource, turl);
 
     turl           += urlargs;
     url             = prepare_url(turl.c_str());
-    path            = "/" + inodeNoStr;
     S3FS_PRN_DBG("[inodeStr=%s],[turl=%s],[url=%s],[path=%s]", inodeNoStr.c_str(), turl.c_str(), url.c_str(), path.c_str());
 
     requestHeaders  = NULL;
@@ -3718,14 +3747,14 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_obs_meta_mtime, str(time(NULL)).c_str());
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_plog_headversion, plogHeadVersion.c_str());
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_version_id, fsVersionId.c_str());
-    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_origin_name, originName.c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_origin_name, urlEncode(originName).c_str());
 
     string maxDHTViewVersion = toString(getMaxDHTViewVersionId());
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_dht_version, maxDHTViewVersion.c_str());
 
     if (0 != strcmp(dentryname.c_str(), ""))
     {
-        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, dentryname.c_str());
+        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(dentryname).c_str());
     }
     if (true == fileMeta->firstWritFlag)
     {
@@ -3793,29 +3822,38 @@ int S3fsCurl::RenameFileOrDirObject(const char *from, const char *to, bool& need
         return -1;
     }
 
-    query_string = renameparmname + toString(to);
-    string urlargs = "?" + query_string;
+    path = get_realpath(from);
 
     string resource;
     string turl;
     MakeUrlResource(get_realpath(from).c_str(), resource, turl);
 
-    turl           += urlargs;
+    //tmp url for CalcSignatureV2, because osc use decode querystring to CalcSignature
+    string turl_tmp = turl;
+    query_string    = "name=" + toString(to) + "&rename";
+    turl           += ("?" + query_string);
     url             = prepare_url(turl.c_str());
-    S3FS_PRN_DBG("[turl=%s],[url=%s]", turl.c_str(), url.c_str());
+    S3FS_PRN_DBG("CalcSignatureV2 [turl=%s],[url=%s]", turl.c_str(), url.c_str());
 
     requestHeaders  = NULL;
     responseHeaders.clear();
     bodydata        = new BodyData();
+    string contype  = S3fsCurl::LookupMimeType(string(from));
 
     // "x-hws-s3fs-client", true always
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_client, "true");
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_connection, "keep-alive");
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_obs_meta_mtime, str(time(NULL)).c_str());
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-Type", contype.c_str());
 
     op = "POST";
     type = REQTYPE_POST;
     insertAuthHeaders();
+    //real url for post, encode rename_to ,maybe have chinese
+    query_string = "name=" + urlEncode(toString(to)) + "&rename";
+    turl         = turl_tmp + "?" + query_string;
+    url          = prepare_url(turl.c_str());
+    S3FS_PRN_DBG("real [turl=%s],[url=%s]", turl.c_str(), url.c_str());
     // setopt
     RenameSetopt();
 
