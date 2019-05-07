@@ -80,7 +80,7 @@ static const char* g_sLogLevel[] =
     "DBG", "INFO", "WARN", "ERR", "CRI"
 };
 
-uint32_t g_index_log_level = INDEX_LOG_INFO;
+uint32_t g_index_log_level = INDEX_LOG_DEBUG;
 
 /*****************************************************************************
 *   Prototype    : CreateLogBuf

@@ -17,6 +17,9 @@ using namespace std;
 
 extern bool use_obsfs_log;
 extern bool cache_assert;
+extern struct timespec hws_s3fs_start_ts;
+//extern function
+extern long diff_in_ms(struct timespec *start, struct timespec *end);
 extern s3fs_log_level set_s3fs_log_level(s3fs_log_level level);
 
 #define READ_LOG_CONFIGURE_INTERVAL 10
@@ -42,6 +45,11 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
         HWS_CFG_CACHE_ASSERT,
         "cacheassert",
         0
+    },
+    {
+        HWS_CFG_COULDNT_RESOLVE_HOST,
+        "can_not_resolve_host_retrycnt",
+        10
     }
     
 };
@@ -133,16 +141,16 @@ void HwsConfigure::hwsApplyConfigParam()
         }
         if (new_log_mode != LOG_MODE_FOREGROUND) 
         {
-            /*must modify to SYSLOG or OBSFS*/
-            debug_log_mode = LOG_MODE_SYSLOG;
-            if (LOG_MODE_OBSFS == new_log_mode)
+            struct timespec now_ts;
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
+            /*set obsfs log mod must delay 5 second after start*/
+            if (diff_in_ms(&hws_s3fs_start_ts, &now_ts) < OBSFS_LOG_MODE_SET_DELAY_MS)
             {
-                /*delay set obsfs mode after start*/
-                use_obsfs_log = true;            
+                debug_log_mode = LOG_MODE_SYSLOG;
             }
             else
             {
-                use_obsfs_log = false;                            
+                debug_log_mode = new_log_mode;
             }
         }
         bool new_cache_assert = 
