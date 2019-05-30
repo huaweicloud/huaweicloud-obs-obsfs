@@ -58,7 +58,7 @@ bool g_s3fs_start_flag = true;
 int s3fs_write_hw_obs_proc_test(const char* data, size_t bytes, off64_t offset)
 {
     int out;
-    out = open(TEST_SIMULATE_OSC_FILE, O_WRONLY|O_CREAT);
+    out = open(TEST_SIMULATE_OSC_FILE, O_WRONLY|O_CREAT, 777);
     pwrite(out, data, bytes, offset);
     close(out);
     cout << "send " << bytes << " bytes at offset " << offset << ",bytes=" <<
@@ -81,7 +81,7 @@ int s3fs_read_hw_obs_proc_test(char* data, size_t bytes, off64_t offset)
     recv_times.fetch_add(1);
     return read_bytes;
 }
-/*Éú³ÉTEST_TEMPLATE_SRC_FILEÎÄ¼ş*/
+/*ç”ŸæˆTEST_TEMPLATE_SRC_FILEæ–‡ä»¶*/
 int GenerateTemplateFile()
 {
     int fd;
@@ -94,7 +94,7 @@ int GenerateTemplateFile()
     struct stat stbuf;
     size_t  timespec_size = sizeof(struct timespec);
 
-    fd = open(TEST_TEMPLATE_SRC_FILE, O_RDWR|O_CREAT);
+    fd = open(TEST_TEMPLATE_SRC_FILE, O_RDWR|O_CREAT, 777);
     if(0 > fd)
     {
         return -1;
@@ -130,11 +130,11 @@ int GenerateTemplateFile()
     return totalSize;
 }
 
-/*´ÓÖ¸¶¨ÎÄ¼ş¶ÁÈ¡Êı¾İµ½»º´æ
-   buf : ¶ÁÄ£°åÎÄ¼şµÄÊä³öbuf
-   buf_size : buf´óĞ¡
-   file_offset £º¶ÁÈ¡Î»ÖÃÔÚÎÄ¼şÄÚÆ«ÒÆÁ¿
-   read_size : ¶ÁÈ¡µÄ´óĞ¡
+/*ä»æŒ‡å®šæ–‡ä»¶è¯»å–æ•°æ®åˆ°ç¼“å­˜
+   buf : è¯»æ¨¡æ¿æ–‡ä»¶çš„è¾“å‡ºbuf
+   buf_size : bufå¤§å°
+   file_offset ï¼šè¯»å–ä½ç½®åœ¨æ–‡ä»¶å†…åç§»é‡
+   read_size : è¯»å–çš„å¤§å°
 */
 int ReadFromTemplate(char* buf, size_t buf_size,off64_t file_offset,
             size_t read_size)
@@ -166,7 +166,7 @@ int ReadFromTemplate(char* buf, size_t buf_size,off64_t file_offset,
     return readBytes;
 }
 
-/*Ğ£Ñé¶Á³öÊı¾İµÄÕıÈ·ĞÔ
+/*æ ¡éªŒè¯»å‡ºæ•°æ®çš„æ­£ç¡®æ€§
    bufWrite and bufRead check crc from buf start to checksize
 */
 bool CheckReadWithTemplate(const char* bufRead,off64_t file_offset,
