@@ -203,7 +203,7 @@ void HwsConfigure::hwsAnalyseConfigLine_Int(std::string& line)
 void HwsConfigure::hwsAnalyseConfigFile(bool analyseIntParam)
 {   
     std::fstream fp(g_logConfigurePath);
-    if (NULL == fp)
+    if (false == fp.is_open())
     {
         S3FS_PRN_DBG("open obsfsconfig failed");
         return;
