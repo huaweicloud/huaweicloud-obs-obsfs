@@ -58,7 +58,29 @@ std::string  statis_step[MAX_STEP_STATIS] = {"min_step",
 
                                              "open_file_total",
                                              
-                                             "lib_curl_send"
+                                             "lib_curl_send",
+                                             "readlink_total",
+                                             "makenode_total",
+                                             "makedir_total",
+                                             "unlink_total",
+                                             "rmdir_total",
+                                             "symlink_total",
+                                             "rename_total",
+                                             "chmod_total",
+                                             "chown_total",
+                                             "utimens_total",
+                                             "truncate_total",
+                                             "flush_total",
+                                             "fsync_total",
+                                             "release_total",
+                                             "opendir_total",
+                                             "access_total",
+                                             "setXattr_total",
+                                             "getXattr_total",
+                                             "listXattr_total",
+                                             "removeXattr_total",
+                                             "cache_get_attr_stat_valid",
+                                             "read_beyond_stat_file_size"
                                             };
 
 
@@ -161,11 +183,12 @@ void s3fsStatisEnd(statis_type_t statisId, timeval *pBeginTime,
     gettimeofday(&end_tv, NULL);
 
     unsigned long long diff = getDiffUs(pBeginTime,&end_tv);
-    
-    if (NULL != urlOrPathStr && diff > HWS_STATIS_OPER_LONG_US)
+    unsigned long long statis_long_us = HwsGetIntConfigValue(HWS_CFG_STATIS_OPER_LONG_MS)*1000;
+    if (NULL != urlOrPathStr && diff > statis_long_us)
     {
         S3FS_PRN_WARN("statisTime long,Step(%s),urlOrPathStr=%s,diff(%llu)",
             statis_step[statisId].c_str(),urlOrPathStr,diff);
     }
     s3fsStatis(statisId, diff,&end_tv);
 }
+

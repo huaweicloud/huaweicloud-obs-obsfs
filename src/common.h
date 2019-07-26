@@ -21,6 +21,7 @@
 #ifndef S3FS_COMMON_H_
 #define S3FS_COMMON_H_
 
+#include <sys/stat.h>
 #include "../config.h"
 #include "obsfs_log.h"
 
@@ -51,6 +52,8 @@ typedef struct _tag_index_cache_entry {
     std::string fsVersionId;
     bool        firstWritFlag;
     std::string originName;
+    struct timespec getAttrCacheSetTs;   //time when set stGetAttrStat
+    struct stat     stGetAttrStat;       //cache get attr stat
 }tag_index_cache_entry_t;
 
 //
@@ -110,6 +113,7 @@ enum s3fs_log_mode{
             IndexLog( LOG_INDEX_COMM, 0, S3FS_LOG_LEVEL_TO_OBSFSLOG(level),fmt "%s", __VA_ARGS__); \
          }\
          else{ \
+            s3fsStatisLogModeNotObsfs();\
            syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "%s:%s(%d): " fmt "%s", __FILE__, __func__, __LINE__, __VA_ARGS__); \
          } \
        }
@@ -124,7 +128,8 @@ enum s3fs_log_mode{
             IndexLog( LOG_INDEX_COMM, 0, S3FS_LOG_LEVEL_TO_OBSFSLOG(level),fmt "%s", __VA_ARGS__); \
          }\
          else{ \
-           syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "%s:%s(%d): " fmt "%s", __FILE__, __func__, __LINE__, __VA_ARGS__); \
+            s3fsStatisLogModeNotObsfs();\
+            syslog(S3FS_LOG_LEVEL_TO_SYSLOG(level), "%s:%s(%d): " fmt "%s", __FILE__, __func__, __LINE__, __VA_ARGS__); \
          } \
        }
 
@@ -157,7 +162,6 @@ enum s3fs_log_mode{
 // [NOTE]
 // small trick for VA_ARGS
 //
-#if 1
 #define S3FS_PRN_EXIT(fmt, ...)   S3FS_LOW_LOGPRN_EXIT(fmt, ##__VA_ARGS__, "")
 #define S3FS_PRN_CRIT(fmt, ...)   S3FS_LOW_LOGPRN(S3FS_LOG_CRIT, fmt, ##__VA_ARGS__, "")
 #define S3FS_PRN_ERR(fmt, ...)    S3FS_LOW_LOGPRN(S3FS_LOG_ERR,  fmt, ##__VA_ARGS__, "")
@@ -169,19 +173,8 @@ enum s3fs_log_mode{
 #define S3FS_PRN_INFO2(fmt, ...)  S3FS_LOW_LOGPRN2(S3FS_LOG_INFO, 2, fmt, ##__VA_ARGS__, "")
 #define S3FS_PRN_INFO3(fmt, ...)  S3FS_LOW_LOGPRN2(S3FS_LOG_INFO, 3, fmt, ##__VA_ARGS__, "")
 #define S3FS_PRN_CURL(fmt, ...)   S3FS_LOW_LOGPRN2(S3FS_LOG_CRIT, 0, fmt, ##__VA_ARGS__, "")
-#else
-#define S3FS_PRN_EXIT(fmt, ...)   
-#define S3FS_PRN_CRIT(fmt, ...)   S3FS_LOW_LOGPRN(S3FS_LOG_CRIT, fmt, ##__VA_ARGS__, "")
-#define S3FS_PRN_ERR(fmt, ...)    
-#define S3FS_PRN_WARN(fmt, ...)   
-#define S3FS_PRN_DBG(fmt, ...)    
-#define S3FS_PRN_INFO(fmt, ...)   
-#define S3FS_PRN_INFO0(fmt, ...)  
-#define S3FS_PRN_INFO1(fmt, ...)  
-#define S3FS_PRN_INFO2(fmt, ...)  
-#define S3FS_PRN_INFO3(fmt, ...)  
-#define S3FS_PRN_CURL(fmt, ...)   
-#endif
+#define S3FS_INTF_PRN_LOG(fmt, ...)   S3FS_LOW_LOGPRN2(fuse_intf_log_level, 0, fmt, ##__VA_ARGS__, "")
+#define S3FS_DATA_CACHE_PRN_LOG(fmt, ...)   S3FS_LOW_LOGPRN2(data_cache_log_level, 0, fmt, ##__VA_ARGS__, "")
 //
 // Typedef
 //
@@ -254,7 +247,7 @@ extern const char*    hws_obs_meta_uid;
 extern const char*    hws_obs_meta_gid;
 extern const char*    hws_obs_meta_mode;
 /* file gateway modify end */
-
+extern void s3fsStatisLogModeNotObsfs()     ;
 
 #endif // S3FS_COMMON_H_
 

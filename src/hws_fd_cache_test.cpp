@@ -39,6 +39,7 @@ extern void write_thread_task(struct HwsFdWritePage* page);
 extern void read_thread_task(struct HwsFdReadPage* page);
 extern bool gIsCheckCRC;
 extern size_t gWritePageSize;
+extern bool g_bIntersectWriteMerge; 
 extern size_t gReadPageSize;
 extern size_t gFuseMaxReadSize;
 extern long gCheckCacheSizePeriodMs;
@@ -47,6 +48,8 @@ extern off64_t gMaxCacheMemSize;
 extern unsigned int g_ReadNotHitNum ;
 extern unsigned int g_AllocWritePageTimeoutNum;
 extern long gPrintCacheStatisMs;
+extern int gReadStatSize;
+extern int gReadStatSeqSize;
 
 #define WRITE_PAGE_SIZE (6 * 1024 * 1024)
 #define READ_PAGE_SIZE (6 * 1024 * 1024)
@@ -55,10 +58,15 @@ extern long gPrintCacheStatisMs;
 #define TEST_TEMPLATE_FILE_SIZE    (120 * 1024 * 1024)
 bool g_s3fs_start_flag = true;
 
+//only for compile
+void s3fsStatisLogModeNotObsfs()        
+{
+}
+
 int s3fs_write_hw_obs_proc_test(const char* data, size_t bytes, off64_t offset)
 {
     int out;
-    out = open(TEST_SIMULATE_OSC_FILE, O_WRONLY|O_CREAT, 777);
+    out = open(TEST_SIMULATE_OSC_FILE, O_WRONLY|O_CREAT);
     pwrite(out, data, bytes, offset);
     close(out);
     cout << "send " << bytes << " bytes at offset " << offset << ",bytes=" <<
@@ -81,7 +89,7 @@ int s3fs_read_hw_obs_proc_test(char* data, size_t bytes, off64_t offset)
     recv_times.fetch_add(1);
     return read_bytes;
 }
-/*ç”ŸæˆTEST_TEMPLATE_SRC_FILEæ–‡ä»¶*/
+/*Éú³ÉTEST_TEMPLATE_SRC_FILEÎÄ¼ş*/
 int GenerateTemplateFile()
 {
     int fd;
@@ -94,7 +102,7 @@ int GenerateTemplateFile()
     struct stat stbuf;
     size_t  timespec_size = sizeof(struct timespec);
 
-    fd = open(TEST_TEMPLATE_SRC_FILE, O_RDWR|O_CREAT, 777);
+    fd = open(TEST_TEMPLATE_SRC_FILE, O_RDWR|O_CREAT);
     if(0 > fd)
     {
         return -1;
@@ -130,11 +138,11 @@ int GenerateTemplateFile()
     return totalSize;
 }
 
-/*ä»æŒ‡å®šæ–‡ä»¶è¯»å–æ•°æ®åˆ°ç¼“å­˜
-   buf : è¯»æ¨¡æ¿æ–‡ä»¶çš„è¾“å‡ºbuf
-   buf_size : bufå¤§å°
-   file_offset ï¼šè¯»å–ä½ç½®åœ¨æ–‡ä»¶å†…åç§»é‡
-   read_size : è¯»å–çš„å¤§å°
+/*´ÓÖ¸¶¨ÎÄ¼ş¶ÁÈ¡Êı¾İµ½»º´æ
+   buf : ¶ÁÄ£°åÎÄ¼şµÄÊä³öbuf
+   buf_size : buf´óĞ¡
+   file_offset £º¶ÁÈ¡Î»ÖÃÔÚÎÄ¼şÄÚÆ«ÒÆÁ¿
+   read_size : ¶ÁÈ¡µÄ´óĞ¡
 */
 int ReadFromTemplate(char* buf, size_t buf_size,off64_t file_offset,
             size_t read_size)
@@ -166,7 +174,7 @@ int ReadFromTemplate(char* buf, size_t buf_size,off64_t file_offset,
     return readBytes;
 }
 
-/*æ ¡éªŒè¯»å‡ºæ•°æ®çš„æ­£ç¡®æ€§
+/*Ğ£Ñé¶Á³öÊı¾İµÄÕıÈ·ĞÔ
    bufWrite and bufRead check crc from buf start to checksize
 */
 bool CheckReadWithTemplate(const char* bufRead,off64_t file_offset,
@@ -237,6 +245,9 @@ namespace {
          g_test_read_page_disable_step.store(0);
          HwsFdManager::GetInstance().CheckCacheMemSize();
          gCheckCacheSizePeriodMs = 0;
+         gReadStatSeqSize = 6;
+         gReadStatDiffLongMs = 1000;
+         gReadStatDiffShortMs = 500;
       }
 
       void TearDown() override {
@@ -479,6 +490,27 @@ namespace {
         HwsFdManager::GetInstance().Close(0);
     }
 
+    //intersect write merge
+    TEST_F(HwsFdCacheTest, HwsFdWrite010) {
+        bool oldCheckCRC = gIsCheckCRC;
+        gIsCheckCRC = false;
+        g_bIntersectWriteMerge = true;
+        
+        gWritePageSize = WRITE_PAGE_SIZE;
+        char buf[WRITE_PAGE_SIZE] = {0};
+        std::shared_ptr<HwsFdEntity> ent0 = HwsFdManager::GetInstance().Open("/home/test", 0, 0);
+        ent0 = HwsFdManager::GetInstance().Get(0);
+        ent0->Write(buf, 0, 1024*8);
+        ent0->Write(buf, 1024*4, 1024*8);
+        ent0->Write(buf, 1024*12, 1024*4);        
+        std::this_thread::sleep_for(std::chrono::milliseconds(HWS_WRITE_PAGE_WAIT_TIME_MS+200));
+        EXPECT_EQ(send_times.load(), 1);
+
+        HwsFdManager::GetInstance().Close(0);
+        gIsCheckCRC = oldCheckCRC;
+        g_bIntersectWriteMerge = false;
+    }
+
     TEST_F(HwsFdCacheTest, HwsFdWriteCrc001) {
         bool oldCheckCRC = gIsCheckCRC;
         gIsCheckCRC = true;
@@ -486,8 +518,10 @@ namespace {
         std::mutex write_merge_mutex;
         struct HwsFdWritePage testWritePage("/home/test", 0, 1024*1024,
             write_merge_mutex,write_thread_task);
-        testWritePage.Append(buf,0, 512*1024);
-        testWritePage.Append(buf,512*1024, 512*1024);
+
+        bool needRetry = true;        
+        testWritePage.Append(buf,0, 512*1024,&needRetry);
+        testWritePage.Append(buf,512*1024, 512*1024,&needRetry);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         EXPECT_EQ(testWritePage.state_, HWS_FD_WRITE_STATE_FINISH);
         gIsCheckCRC = oldCheckCRC;
@@ -500,9 +534,10 @@ namespace {
         std::mutex write_merge_mutex;
         struct HwsFdWritePage testWritePage("/home/test", 0, 1024*1024,
             write_merge_mutex,write_thread_task);
-        testWritePage.Append(buf,0, 512*1024);
+        bool needRetry = true;        
+        testWritePage.Append(buf,0, 512*1024,&needRetry);
         testWritePage.data_[0] += 1;
-        testWritePage.Append(buf,512*1024, 512*1024);
+        testWritePage.Append(buf,512*1024, 512*1024,&needRetry);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         EXPECT_EQ(testWritePage.state_, HWS_FD_WRITE_STATE_ERROR);
         gIsCheckCRC = oldCheckCRC;
@@ -550,7 +585,8 @@ namespace {
     }
 
     TEST_F(HwsFdCacheTest, HwsFdReadStat001) {
-        class HwsFdReadStatVec testReadStat(8, 6, 4*1024*1024, 1000);
+        class HwsFdReadStatVec testReadStat(8);
+        gReadStatSize = 8;
         EXPECT_EQ(testReadStat.IsSequential(), false);
         testReadStat.Add("/home/test",0, 512*1024);
         testReadStat.Add("/home/test",1*512*1024, 512*1024);
@@ -562,10 +598,12 @@ namespace {
         EXPECT_EQ(testReadStat.IsSequential(), false);
         testReadStat.Add("/home/test",11*512*1024, 512*1024);
         EXPECT_EQ(testReadStat.IsSequential(), false);
+        gReadStatSize = 32;
     }
 
     TEST_F(HwsFdCacheTest, HwsFdReadStat002) {
-        class HwsFdReadStatVec testReadStat(8, 6, 4*1024*1024, 1000);
+        class HwsFdReadStatVec testReadStat(8);
+        gReadStatSize = 8;
         EXPECT_EQ(testReadStat.IsSequential(), false);
         testReadStat.Add("/home/test",1*512*1024, 512*1024);
         testReadStat.Add("/home/test",0, 512*1024);
@@ -578,10 +616,12 @@ namespace {
         std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         testReadStat.Add("/home/test",10*512*1024, 512*1024);
         EXPECT_EQ(testReadStat.IsSequential(), false);
+        gReadStatSize = 32;
     }
 
     TEST_F(HwsFdCacheTest, HwsFdReadStat003) {
-        class HwsFdReadStatVec testReadStat(8, 6, 4*1024*1024, 1000);
+        class HwsFdReadStatVec testReadStat(8);
+        gReadStatSize = 8;
         EXPECT_EQ(testReadStat.IsSequential(), false);
         testReadStat.Add("/home/test",1*512*1024, 512*1024);
         testReadStat.Add("/home/test",0, 512*1024);
@@ -594,10 +634,12 @@ namespace {
         testReadStat.Add("/home/test",10*512*1024, 512*1024);
         EXPECT_EQ(testReadStat.IsSequential(), true);
         EXPECT_EQ(testReadStat.GetOffset(), 11*512*1024);
+        gReadStatSize = 32;
     }
 
     TEST_F(HwsFdCacheTest, HwsFdReadStat004) {
-        class HwsFdReadStatVec testReadStat(8, 6, 4*1024*1024, 1000);
+        class HwsFdReadStatVec testReadStat(8);
+        gReadStatSize = 8;
         EXPECT_EQ(testReadStat.IsSequential(), false);
         testReadStat.Add("/home/test",0, 512*1024);
         testReadStat.Add("/home/test",1*512*1024, 512*1024);
@@ -610,10 +652,12 @@ namespace {
         testReadStat.Add("/home/test",11*512*1024, 512*1024);
         EXPECT_EQ(testReadStat.IsSequential(), true);
         EXPECT_EQ(testReadStat.GetOffset(), 10*512*1024);
+        gReadStatSize = 32;
     }
 
     TEST_F(HwsFdCacheTest, HwsFdReadStat005) {
-        class HwsFdReadStatVec testReadStat(8, 6, 4*1024*1024, 1000);
+        class HwsFdReadStatVec testReadStat(8);
+        gReadStatSize = 8;
         EXPECT_EQ(testReadStat.IsSequential(), false);
         testReadStat.Add("/home/test",0, 512*1024);
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -631,6 +675,7 @@ namespace {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         testReadStat.Add("/home/test",7*512*1024, 512*1024);
         EXPECT_EQ(testReadStat.IsSequential(), false);
+        gReadStatSize = 32;
     }
 
     TEST_F(HwsFdCacheTest, HwsFdReadHit001) {
@@ -638,7 +683,7 @@ namespace {
         s3fs_write_hw_obs_proc_test(buf, 1024*1024, 0);
         std::mutex write_merge_mutex_;
         std::mutex read_ahead_mutex_;
-        class HwsFdReadPageList testPageList(1024*1024, 1000,read_ahead_mutex_);
+        class HwsFdReadPageList testPageList(1024*1024, read_ahead_mutex_);
         class HwsFdWritePageList testWritePageList(1024*1024,write_merge_mutex_);
         testPageList.ReadAhead("/home/test", 0, testWritePageList,1024*1024);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1518,6 +1563,8 @@ void mock_invalid_read_page(struct HwsFdReadPage* page, int read_size)
 {
     if (g_test_read_page_disable_step.load() > 0)
     {
+        std::cout << "do mock_invalid_read_page, path: " << page->path_.c_str()
+        << " ,off: " << page->offset_ << " ,read_size: " << read_size << std::endl;
         // wait to be invalid by write
         g_test_read_page_disable_step.store(2);
         int rounds = 100; // in case of testcase error

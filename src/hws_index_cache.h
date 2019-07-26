@@ -23,6 +23,8 @@
 #include "common.h"
 #include "snas_list.h"
 #include <assert.h>
+#include <time.h>
+
 using namespace std;
 
 extern bool cache_assert;
@@ -83,6 +85,9 @@ public:
     size_t SetCacheSize(size_t size);
     int setFirstWriteFlag(string key);
     void ReplaceIndex(string srcKey, string destKey, tag_index_cache_entry_t* p_index_cache_entry);
+    int setFilesizeOrClearGetAttrStat(string path,
+            off64_t cacheFileSize,bool clearGetAttrStat);
+    void AddEntryOpenCnt(string path);
 
 
 private:
@@ -178,7 +183,46 @@ int IndexCache::setFirstWriteFlag(string key)
 
     return 0;
 }
+int IndexCache::setFilesizeOrClearGetAttrStat(string path,
+        off64_t cacheFileSize,bool clearGetAttrStat)
+{
+    pthread_spin_lock(&(index_cache_lock));
+    Node *node = hashmap_[path];
+    off64_t tempFileSize = -1;
 
+    if(node)
+    {
+        if (cacheFileSize > node->data.stGetAttrStat.st_size)
+        {
+            node->data.stGetAttrStat.st_size = cacheFileSize;
+            tempFileSize = node->data.stGetAttrStat.st_size;
+        }
+        node->data.stGetAttrStat.st_mtime = time((time_t *)NULL);
+        //clear getAttrCacheSetTs so stGetAttrStat is invalid
+        if (clearGetAttrStat)
+        {
+            memset(&(node->data.stGetAttrStat), 0, sizeof(struct stat));    
+            memset(&(node->data.getAttrCacheSetTs), 0, sizeof(struct timespec));    
+        }
+    }
+    pthread_spin_unlock(&(index_cache_lock));
+
+    S3FS_PRN_INFO("set statCache,tempFileSize=%ld,cacheFileSize=%ld,path=%s,clearGetAttrMs=%d", 
+        tempFileSize,cacheFileSize,path.c_str(),clearGetAttrStat);
+
+    return 0;
+}
+void IndexCache::AddEntryOpenCnt(string path)
+{
+    pthread_spin_lock(&(index_cache_lock));
+    Node *node = hashmap_[path];
+
+    if(node)
+    {
+        operateOpenCnt(node, ADD_OPEN_CNT);
+    }
+    pthread_spin_unlock(&(index_cache_lock));
+}
 Node* IndexCache::getFreeNodeAndEraseMap(const char* pathStr)
 {
     SNAS_ListHead* pListHead = NULL;
@@ -250,6 +294,9 @@ int IndexCache::putIndexInternal(string key,tag_index_cache_entry_t * data,tag_o
         {
             node->data.originName = data->originName;
         }
+        node->data.getAttrCacheSetTs = data->getAttrCacheSetTs;
+        node->data.stGetAttrStat = data->stGetAttrStat;
+        
         operateOpenCnt(node, openCntType);
         putNodeToList(node, key);
         pthread_spin_unlock(&(index_cache_lock));
@@ -333,7 +380,7 @@ int IndexCache::PutIndexReduceOpenCnt(string key)
         return -1;
     }
 }
-
+//find cache entry by key and copy entry to output data
 bool IndexCache::GetIndex(string key, tag_index_cache_entry_t* data)
 {
     pthread_spin_lock(&(index_cache_lock));

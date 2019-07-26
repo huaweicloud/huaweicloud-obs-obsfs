@@ -16,12 +16,14 @@ extern size_t gWritePageSize;
 extern unsigned int gWritePageNum;
 extern size_t gReadPageSize;
 extern unsigned int gReadPageNum;
-extern long gReadTimeThreshold;
-extern int gReadStatSize;
+extern long gReadPageCleanMs;
+extern int gReadStatSizeMax;
 extern int gReadStatSeqSize;
 extern off64_t gReadStatSizeThreshold;
-extern long gReadStatTimeThreshold;
+extern long gReadStatDiffLongMs;
+extern long gReadStatDiffShortMs;
 extern unsigned int gWriteStatSeqNum;
+extern s3fs_log_level fuse_intf_log_level;
 
 extern void hws_cache_daemon_task();
 
@@ -30,6 +32,7 @@ extern void hws_cache_daemon_task();
 #define HWS_MAX_WRITE_RETRY_MS 3000   /*write page retry max 3 second*/
 #define HWS_ALLOC_MEM_RETRY_MS 40     /*alloc memory delay 40 ms and retry*/
 #define HWS_WRITE_PAGE_WAIT_TIME_MS 3000 /*write page wait time max 3 second since last write*/
+#define HWS_LOG_HASH_BUCKET_NUM   65536  //log hash num for log flow control 
 
 #define HWS_STATIS_PRINT_BUF_SIZE (10*1024)
 
@@ -145,8 +148,10 @@ struct HwsFdWritePage
             delete[] data_;
         }
     }
-
-    size_t Append(const char *buf,off64_t offset, size_t size);
+    size_t IntersectWriteMergeToLastpage(
+            const char *buf,off64_t wrtOffset, size_t wrtSize);
+    size_t Append(const char *buf,off64_t offset, size_t size,
+            bool* pbIsSequential);
     bool Full(){ return bytes_ >= write_page_size_||state_ > HWS_FD_WRITE_STATE_WAIT;}
     bool IsSequential(off64_t offset)
     {
@@ -157,11 +162,11 @@ struct HwsFdWritePage
     {
         return data_;
     }
-    void Ref()
+    void WritePageRef()
     {
         refs_++;
     }
-    void Unref();
+    void WritePageUnref();
     bool CanRelease()
     {
         return refs_ == 0;
@@ -199,7 +204,10 @@ class HwsFdWritePageList
     HwsFdWritePage* OverlapPage(off64_t offset, size_t size);
     bool IsOverlap(off64_t offset, size_t size);
     HwsFdWritePage* OverlapExcludeLastPage(off64_t offset, size_t size);
-    size_t Append(const char *path, const char *buf, off64_t offset, size_t size);
+    bool canIntersectWrtMergeToLastPage(
+            const char* path,off64_t offset, size_t size);
+    size_t Append(const char *path, const char *buf, off64_t offset, 
+            size_t size,bool* pbIsSequential);
     int ReadLastOverLap(const char* path,
         HwsWriteLastPageRead_S *readInfo, size_t offset, size_t readSize);
     void Clean();
@@ -228,12 +236,14 @@ struct HwsFdReadPage
     int      state_;
     std::vector<uint32_t> crc_;
     int      refs_;
-    size_t   read_size_;
+    size_t   read_size_;   //data size in page
+    off64_t  hitSizeInPage;  
     struct timespec got_ts_;
+    struct timespec last_hit_ts_;
     std::mutex& read_ahead_mutex_;    /*for read page list lock*/    
     std::condition_variable cv_;
     std::thread thread_;
-    bool     is_read_finish_;
+    bool     is_read_finish_;     //finish read from osc
     void (*thread_task_)(HwsFdReadPage*);
 
     HwsFdReadPage(const char *path, off64_t offset, size_t read_page_size,
@@ -247,10 +257,12 @@ struct HwsFdReadPage
       state_ = HWS_FD_READ_STATE_RECVING;
       data_ = new char[read_page_size];
       got_ts_ = {0, 0};
+      last_hit_ts_ = {0, 0};
       refs_ = 0;
       read_size_ = 0;
       crc_.reserve(read_page_size/HWS_READ_CRC_SIZE);
       is_read_finish_ = false;
+      hitSizeInPage = 0;
       thread_ = std::thread(thread_task_, this);
     }
     ~HwsFdReadPage(){
@@ -259,11 +271,11 @@ struct HwsFdReadPage
     }
     void GenerateCrc(ssize_t read_size);
     bool CheckCrcErr(size_t offset, size_t size);
-    void Ref()
+    void ReadPageRef()
     {
         refs_++;
     }
-    void Unref();
+    void ReadPageUnref();
     bool CanRelease()
     {
         return refs_ == 0;
@@ -275,21 +287,26 @@ class HwsFdReadPageList
   private:
     std::deque<HwsFdReadPage*> pages_;
     const size_t read_page_size_;   /*page size,default gReadPageSize*/
-    const long time_threshold_;
     std::mutex& read_ahead_mutex_;    /*for read page list lock*/    
     off64_t   hit_max_offset_;         /*read hit max offset in file*/        
     unsigned int total_hit_size;  /*count total read hit size*/
     unsigned int read_ahead_beyond_filesize_num;
+    long firstToLastDiffMs;
+    off64_t lastReadOffset;    
+    struct timespec lastCleanTs;
     
   public:
-    HwsFdReadPageList(size_t read_page_size, long time_threshold,
+    HwsFdReadPageList(size_t read_page_size,
         std::mutex& read_ahead_mutex)
-        :read_page_size_(read_page_size), time_threshold_(time_threshold),
+        :read_page_size_(read_page_size), 
         read_ahead_mutex_(read_ahead_mutex)
     {
         hit_max_offset_ = 0;
         total_hit_size = 0;
         read_ahead_beyond_filesize_num = 0;
+        firstToLastDiffMs = 0;
+        lastReadOffset = 0;
+        lastCleanTs = {0, 0};
     }
     ~HwsFdReadPageList();
     HwsFdReadPageList(const HwsFdReadPageList&) = delete;
@@ -299,6 +316,7 @@ class HwsFdReadPageList
         HwsFdWritePageList& writePage,off64_t fileSize);
     void ReadAheadOnePage(const char* path, off64_t offset, 
             HwsFdWritePageList& writePage,off64_t fileSize);
+    bool PageNeedFree(HwsFdReadPage* page);
     void Clean();
     void Invalid(off64_t offset, size_t size);
     HwsFdReadPage* OverlapPage(off64_t offset, size_t size);
@@ -315,6 +333,15 @@ class HwsFdReadPageList
     {
         total_hit_size = 0;
     }
+    long getFirstToLastDiffMs()
+    {
+        return firstToLastDiffMs;
+    }
+    void setFirstToLastDiffMs(long firstToLastMs)
+    {
+        firstToLastDiffMs = firstToLastMs; 
+    }
+    
 };
 
 struct HwsFdReadStat
@@ -326,29 +353,29 @@ struct HwsFdReadStat
 class HwsFdReadStatVec
 {
   private:
-    const int size_;    
-    const int seq_size_;
-    const off64_t size_threshold_;
-    const long time_threshold_;
     std::vector<HwsFdReadStat> stat_;
     struct timespec first_ts_;
     struct timespec last_ts_;
-    int count_;
     bool isSequential_;
-    off64_t offset_;
+    off64_t offset_;   //read ahead offset
+    long firstToLastDiffMs;
   public:
-    HwsFdReadStatVec(int size, int seq_size, size_t size_threshold, long time_threshold)
-        :size_(size), seq_size_(seq_size), size_threshold_(size_threshold), time_threshold_(time_threshold)
+    HwsFdReadStatVec(int size)
     {
         stat_.reserve(size);
-        count_ = 0;
         isSequential_ = false;
         offset_ = 0;
+        firstToLastDiffMs = 0;
     }
     ~HwsFdReadStatVec(){}
     void Add(const char* path,off64_t offset, size_t size);
+    long GetReadStatDiffThreshold();
     bool IsSequential(){return isSequential_;}
     off64_t GetOffset(){return offset_;}
+    long getFirstToLastDiffMs()
+    {
+        return firstToLastDiffMs;
+    }
 };
 
 class HwsFdEntity
@@ -368,7 +395,7 @@ class HwsFdEntity
     uint32_t write_full_count;
     uint32_t sequential_modify_count_;
     int curr_write_mode_;
-    off64_t write_end_;
+    off64_t write_end_;   //last write end position
 
   private:
     bool IsAppend(off64_t offset, size_t size)
@@ -398,7 +425,6 @@ class HwsFdEntity
 
         return sequential_modify_count_ >= gWriteStatSeqNum;
     }
-    
   bool IsNeedWriteMerge(const char *path, 
       off64_t offset, size_t size, std::unique_lock<std::mutex>& lock);
 
@@ -406,8 +432,8 @@ class HwsFdEntity
     HwsFdEntity(const char* path, const long long inodeNo, const off64_t fileSize)
             : path_(path), inodeNo_(inodeNo), fileSize_(fileSize),
               writePage_(gWritePageSize,entity_mutex_),
-              readPage_(gReadPageSize, gReadTimeThreshold,entity_mutex_),
-              readStat_(gReadStatSize, gReadStatSeqSize, gReadStatSizeThreshold, gReadStatTimeThreshold)
+              readPage_(gReadPageSize, entity_mutex_),
+              readStat_(gReadStatSizeMax)
     {
         refs_ = 0;
         retryNum = 0;

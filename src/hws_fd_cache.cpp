@@ -16,6 +16,7 @@
 #include "common.h"
 #include "hws_fd_cache.h"
 #include "crc32c.h"
+#include "hws_configure.h"
 
 #ifdef HWS_FD_CACHE_TEST
 extern int s3fs_write_hw_obs_proc_test(const char* buf, size_t size, off_t offset);
@@ -31,18 +32,25 @@ extern int s3fs_read_hw_obs_proc(const char* path, char* buf, size_t size, off_t
 #define HWS_CACHE_ADJUST_SIZE (500*HWS_MB_SIZE)
 #define HWS_LOG_FLOW_CONTROL_MS 3000  /*err log flow control,3 second print one*/
 
+s3fs_log_level data_cache_log_level;
+
 bool gIsReadWaitCache = true;
 size_t gWritePageSize = 6 * 1024 * 1024 - 128 * 1024;
 unsigned int gWritePageNum = 12;
 size_t gReadPageSize = 6 * 1024 *1024;
 unsigned int gReadPageNum = 12;
-long gReadTimeThreshold = 1000;
+long gReadPageCleanMs = 1000;
+int gReadStatSizeMax = 32;
 int gReadStatSize = 32;
 int gReadStatSeqSize = 24;
 off64_t gReadStatSizeThreshold = 4 * 1024 * 1024;
-long gReadStatTimeThreshold = 10000;   /*10 seconds*/
+long gReadStatDiffLongMs = 120000;   /*120 seconds*/
+/*10 seconds,one read 0.2s,24 read need 4.8s,must larger than 4.8s*/
+long gReadStatDiffShortMs = 10000;   
+int  gFreeCacheThresholdPercent = 20;  /*if lower than this percent,use gReadStatDiffShortMs*/
 bool gIsCheckCRC = true;
 unsigned int gWriteStatSeqNum = 3;     /*if sequential modify 3 times,merge write*/
+bool g_bIntersectWriteMerge = false;   /*if merge intersect write to write cache*/
 size_t gFuseMaxReadSize = 128 * 1024;
 off64_t gMaxCacheMemSize = 1024 * HWS_MB_SIZE;
 long gCheckCacheSizePeriodMs = 10000;   /*10 seconds*/
@@ -51,9 +59,11 @@ unsigned int g_ReadNotHitNum = 0;   /*for UT*/
 long gPrintCacheStatisMs =  300000;  /*print statis every 300 second*/
 /*num for alloc write page retry beyond 3 second*/
 unsigned int g_AllocWritePageTimeoutNum = 0;   
+int  g_aulPrintLogCnt[HWS_LOG_HASH_BUCKET_NUM] = {0};    //for print log flow control
 
 // TODO: move function to Utility
 #define TIME_FORMAT_LENGTH 20
+
 static void get_current_time(char* buffer, unsigned int length)
 {
     memset(buffer, '\0', length);
@@ -102,20 +112,52 @@ long diff_in_ms(struct timespec *start, struct timespec *end)
 {
     return (end->tv_sec - start->tv_sec)*1000 + ((long)end->tv_nsec - (long)start->tv_nsec)/1000000;
 }
-
-bool can_pint_log_with_fc()
+/*print statis result and clear statis*/
+void clearPrintLogNum()       
 {
-    static struct timespec last_print_time;
-
+    static struct timespec prev_clear_ts;
     struct timespec now_ts;
+    
     clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
-    if (diff_in_ms(&last_print_time, &now_ts) < HWS_LOG_FLOW_CONTROL_MS)
+    /*print every 30 seconds*/
+    long clearDiffMs  = diff_in_ms(&prev_clear_ts, &now_ts);
+    if (clearDiffMs < 30000)
     {
-        return false;
+        return;
+    }
+    memset((void *)g_aulPrintLogCnt, 0, sizeof(int) * HWS_LOG_HASH_BUCKET_NUM);
+    prev_clear_ts = now_ts;
+    
+    S3FS_PRN_DBG("clearDiffMs=%ld",clearDiffMs);
+}
+
+bool can_pint_log_with_fc(int uiLineNum)
+{    
+#ifdef HWS_FD_CACHE_TEST
+        return true;
+#else    
+    int ulHashIndex = 0;
+    bool bCanPrint = true;
+    
+    ulHashIndex = uiLineNum % HWS_LOG_HASH_BUCKET_NUM;
+    
+    if  (g_aulPrintLogCnt[ulHashIndex] >= HwsGetIntConfigValue(HWS_CFG_MAX_PRINT_LOG_NUM_PERIOD))
+    {
+        bCanPrint = false;
     }
 
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &last_print_time);
-    return true;        
+    if ( true == bCanPrint )
+    {
+        g_aulPrintLogCnt[ulHashIndex] += 1;
+    }
+
+    S3FS_PRN_DBG("bCanPrint=%d,printCnt=%d,cfgMax=%d,uiLineNum=%d", 
+        bCanPrint,g_aulPrintLogCnt[ulHashIndex],HwsGetIntConfigValue(HWS_CFG_MAX_PRINT_LOG_NUM_PERIOD),
+        uiLineNum);
+
+    return bCanPrint;        
+    
+#endif
 }
 
 bool is_new_merge_happened(struct HwsFdWritePage* page)
@@ -129,7 +171,11 @@ bool is_new_merge_happened(struct HwsFdWritePage* page)
 
 void write_thread_task(struct HwsFdWritePage* page)
 {
-    ssize_t result = 0;
+    ssize_t result = 0;    
+    
+    struct timespec begin_ts;    
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &begin_ts);
+    
     std::unique_lock<std::mutex> lock(page->write_merge_mutex_);
     while(page->state_ == HWS_FD_WRITE_STATE_WAIT)
     {
@@ -191,15 +237,23 @@ void write_thread_task(struct HwsFdWritePage* page)
             page->path_.c_str(), page->offset_, page->bytes_, print_err_type(page->err_type_));
     }
     page->cv_.notify_all();
-    S3FS_PRN_INFO("hws cache write path(%s)off(%ld)bytes(%lu)freeCache(%ld)maxCache(%ld)", 
+
+    struct timespec end_ts;    
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &end_ts);
+    long diffMs  = diff_in_ms(&begin_ts, &end_ts);
+    S3FS_DATA_CACHE_PRN_LOG(
+        "hws cache write path(%s)off(%ld)bytes(%lu)freeCache(%ld)maxCache(%ld)diff(%ld)", 
         page->path_.c_str(), page->offset_,page->bytes_,
         HwsFdManager::GetInstance().GetFreeCacheMemSize(),
-        gMaxCacheMemSize);
+        gMaxCacheMemSize,diffMs);
     return;
 }
 
 void read_thread_task(struct HwsFdReadPage* page)
 {
+    struct timespec begin_ts;    
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &begin_ts);
+
     ssize_t read_size = 0;
     read_size = recvfrom_obs(page->path_.c_str(), page->data_, page->read_page_size_, page->offset_);
     page->GenerateCrc(read_size);    
@@ -212,7 +266,7 @@ void read_thread_task(struct HwsFdReadPage* page)
 #endif
     std::lock_guard<std::mutex> lock(page->read_ahead_mutex_);
     clock_gettime(CLOCK_MONOTONIC_COARSE, &page->got_ts_);
-    if(read_size >= 0)
+    if(read_size > 0)
     {
         page->read_size_ = read_size;
         if(page->state_ == HWS_FD_READ_STATE_RECVING)
@@ -228,12 +282,77 @@ void read_thread_task(struct HwsFdReadPage* page)
     page->is_read_finish_ = true;
     page->cv_.notify_all();
     
-    S3FS_PRN_INFO("hws cache read,path(%s)off(%ld)read_size(%lu),freeCache(%ld)"
-        "maxCache(%ld)",
+    struct timespec end_ts;    
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &end_ts);
+    long diffMs  = diff_in_ms(&begin_ts, &end_ts);
+    S3FS_DATA_CACHE_PRN_LOG("hws cache read,path(%s)off(%ld)read_size(%lu),freeCache(%ld)"
+        "maxCache(%ld),state_(%d),got_ts_(%ld)diff(%ld)",
         page->path_.c_str(), page->offset_,read_size,
-        HwsFdManager::GetInstance().GetFreeCacheMemSize(),gMaxCacheMemSize);
+        HwsFdManager::GetInstance().GetFreeCacheMemSize(),gMaxCacheMemSize,page->state_,
+        page->got_ts_.tv_sec,diffMs);
     return;
 }
+void setFdCacheGlobalVariableByCfg()
+{
+    static struct timespec prev_set_by_cfg_ts;
+    struct timespec now_ts;
+    
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
+    /*print every 60 seconds*/
+    long clearDiffMs  = diff_in_ms(&prev_set_by_cfg_ts, &now_ts);
+    if (clearDiffMs < 60000)
+    {
+        return;
+    }
+    prev_set_by_cfg_ts = now_ts;
+    
+#ifdef HWS_FD_CACHE_TEST  //hws_fd_cache_test can not compile config function
+    return;
+#else    
+    gReadPageCleanMs = HwsGetIntConfigValue(HWS_CFG_READ_PAGE_CLEAN_MS); 
+    gReadStatDiffLongMs = HwsGetIntConfigValue(HWS_READ_AHEAD_STAT_DIFF_LONG); 
+    gReadStatDiffShortMs = HwsGetIntConfigValue(HWS_READ_AHEAD_STAT_DIFF_SHORT); 
+    gMaxCacheMemSize = (long)HwsGetIntConfigValue(HWS_CFG_MAX_CACHE_MEM_SIZE_MB) * HWS_MB_SIZE;
+    gIsCheckCRC = (bool)HwsGetIntConfigValue(HWS_CFG_CACHE_CHECK_CRC_OPEN); 
+    int cfgStatVecSize     = HwsGetIntConfigValue(HWS_READ_STAT_VEC_SIZE); 
+    if (cfgStatVecSize < gReadStatSizeMax)
+    {
+        gReadStatSize = cfgStatVecSize;
+    }
+    int cfgStatSequentialSize = HwsGetIntConfigValue(HWS_READ_STAT_SEQUENTIAL_SIZE); 
+    if (cfgStatSequentialSize < gReadStatSize)
+    {
+        gReadStatSeqSize  = cfgStatSequentialSize; 
+    }
+    gReadStatSizeThreshold = (off64_t)HwsGetIntConfigValue(HWS_READ_STAT_SIZE_THRESHOLD); 
+    S3FS_DATA_CACHE_PRN_LOG(
+        "gReadPageCleanMs=%ld,gReadStatDiffLongMs=%ld,gReadStatDiffShortMs=%ld",
+        gReadPageCleanMs,gReadStatDiffLongMs,gReadStatDiffShortMs);
+    S3FS_DATA_CACHE_PRN_LOG(
+        "gMaxCacheMemSize=%ld,gIsCheckCRC=%d",gMaxCacheMemSize,gIsCheckCRC);
+    S3FS_DATA_CACHE_PRN_LOG(
+        "gReadStatSize=%d,gReadStatSeqSize=%d,StatSizeThreshold=%ld",
+        gReadStatSize,gReadStatSeqSize,gReadStatSizeThreshold);
+    gWritePageNum = HwsGetIntConfigValue(HWS_WRITE_PAGE_NUM);
+    gReadPageNum = HwsGetIntConfigValue(HWS_READ_PAGE_NUM);
+    S3FS_DATA_CACHE_PRN_LOG(
+         "gWritePageNum=%d, gReadPageNum=%d,", gWritePageNum, gReadPageNum);
+    gFreeCacheThresholdPercent = HwsGetIntConfigValue(HWS_FREE_CACHE_THRESHOLD_PERCENT);        
+    int cfgIntersectWriteMerge = HwsGetIntConfigValue(HWS_INTERSECT_WRITE_MERGE); 
+    g_bIntersectWriteMerge = (cfgIntersectWriteMerge == 0) ? false : true;
+    if (g_bIntersectWriteMerge)
+    {
+        gIsCheckCRC = false;
+        S3FS_DATA_CACHE_PRN_LOG(
+            "change checkCrc false for intersectMerge,gIsCheckCRC=%d",gIsCheckCRC);
+    }
+    S3FS_DATA_CACHE_PRN_LOG(
+        "FreeCachePercent=%d,g_bIntersectWriteMerge=%d",
+        gFreeCacheThresholdPercent,g_bIntersectWriteMerge);
+    
+#endif    
+}
+
 /*daemon thread function,adjust cache mem size*/
 void hws_cache_daemon_task()
 {
@@ -244,13 +363,15 @@ void hws_cache_daemon_task()
          HwsFdManager::GetInstance().CheckCacheMemSize();
          HwsCacheStatis::GetInstance().PrintStatisAndClear();
          std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+         clearPrintLogNum();
+         setFdCacheGlobalVariableByCfg();
     }
 }
 /*wait write page write to obs;
   must lock write_merge_mutex_ in caller*/
 void wait_write_task_finish(struct HwsFdWritePage* page,std::unique_lock<std::mutex>& lock)
 {
-    page->Ref();
+    page->WritePageRef();
     if(page->state_ == HWS_FD_WRITE_STATE_WAIT)
     {
         page->state_ = HWS_FD_WRITE_STATE_NOTIFY;
@@ -260,24 +381,24 @@ void wait_write_task_finish(struct HwsFdWritePage* page,std::unique_lock<std::mu
     {
         page->cv_.wait(lock);
     }
-    page->Unref();
+    page->WritePageUnref();
     return;
 }
 /*wait page read from obs;
   must lock read_ahead_mutex_ in caller*/
 void wait_read_task_finish(struct HwsFdReadPage* page,std::unique_lock<std::mutex>& lock)
 {
-    page->Ref();
+    page->ReadPageRef();
     while(page->state_ == HWS_FD_READ_STATE_RECVING)
     {
         page->cv_.wait(lock);
     }
-    page->Unref();
+    page->ReadPageUnref();
     return;
 }
 /*alloc mem,if fail,retry until succeed*/
 void* AllocMemWithRetry(size_t size)
-{
+{  
     static off64_t retryNum = 0;
     
     void* buffer = nullptr;
@@ -298,7 +419,7 @@ void* AllocMemWithRetry(size_t size)
 
         if (nullptr == buffer)
         {
-            if (can_pint_log_with_fc())
+            if (can_pint_log_with_fc(__LINE__))
             {
                 S3FS_PRN_ERR("alloc mem fail! size(%zu),total retry(%ld)",
                     size,retryNum);                
@@ -311,11 +432,54 @@ void* AllocMemWithRetry(size_t size)
 
     return buffer;
 }
-
-/*append buf to page list;  
+/*copy intersect write to last page;  
   must lock write_merge_mutex_ in caller*/
-size_t HwsFdWritePage::Append(const char *buf,off64_t offset, size_t size)
+size_t HwsFdWritePage::IntersectWriteMergeToLastpage(
+        const char *buf,off64_t wrtOffset, size_t wrtSize)
 {
+    // if state_ != HWS_FD_WRITE_STATE_WAIT 
+    //or size > write_page_size_ - bytes_, return in Append function
+
+    bool canMerge = false;    
+    if ((wrtOffset <= offset_ + (off64_t)bytes_) &&
+        (wrtOffset >= offset_))
+    {
+        //write offset in page data range
+        canMerge = true;
+    }
+    if (canMerge == false)
+    {
+        S3FS_PRN_WARN(
+            "canMerge is false,path(%s)offset(%ld),wrtSize(%lu)",
+            path_.c_str(),wrtOffset,wrtSize);
+        return 0;
+    }
+    size_t copy_offset_in_page = wrtOffset - offset_;
+    if (copy_offset_in_page + wrtSize >= write_page_size_)
+    {
+        //write end beyond page size
+        S3FS_PRN_WARN(
+            "beyond last page,path(%s)offset(%ld),wrtSize(%lu)pageoff(%ld)pgSize(%lu)",
+            path_.c_str(),wrtOffset,wrtSize,offset_,write_page_size_);
+        return 0;
+    }
+
+    memcpy(data_+copy_offset_in_page, buf, wrtSize);
+    bytes_ = max(bytes_,copy_offset_in_page+wrtSize);
+    // update last_write_ts
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &last_write_ts_);
+    S3FS_DATA_CACHE_PRN_LOG(
+        "merge to last,path(%s)offset(%ld),size(%lu)pageoff(%ld)"
+        "bytes(%lu)copyOffset(%lu)",
+        path_.c_str(),wrtOffset,wrtSize,offset_,bytes_,copy_offset_in_page);
+    return wrtSize;    
+}
+/*append buf to page list;  pbIsSequential is output para
+  must lock write_merge_mutex_ in caller*/
+size_t HwsFdWritePage::Append(const char *buf,off64_t offset, size_t size,
+            bool* pbIsSequential)
+{
+    *pbIsSequential = true;
     if(state_ != HWS_FD_WRITE_STATE_WAIT)
     {
         return 0;
@@ -325,12 +489,22 @@ size_t HwsFdWritePage::Append(const char *buf,off64_t offset, size_t size)
         state_ = HWS_FD_WRITE_STATE_NOTIFY;
         cv_.notify_all();
         return 0;
-    }
-    else if (offset != offset_ + (off64_t)bytes_)
+    }    
+    else if (offset != offset_ + (off64_t)bytes_)  
     {
-        S3FS_PRN_ERR("write not sequential,path(%s)offset(%ld),pageoff(%ld)bytes(%lu)", 
-            path_.c_str(),offset,offset_,bytes_);
-        return 0;
+        if (g_bIntersectWriteMerge)
+        {
+            *pbIsSequential = false; //intersect write not retry
+            size_t intersectMergeSize = 
+                    IntersectWriteMergeToLastpage(buf,offset,size);
+            return intersectMergeSize;
+        }
+        else  // not support intersect write merge,must sequential
+        {
+            S3FS_PRN_ERR("write not sequential,path(%s)offset(%ld),pageoff(%ld)bytes(%lu)", 
+                path_.c_str(),offset,offset_,bytes_);
+            return 0;
+        }
     }
     
     memcpy(data_+bytes_, buf, size);
@@ -345,12 +519,14 @@ size_t HwsFdWritePage::Append(const char *buf,off64_t offset, size_t size)
     }
     // update last_write_ts
     clock_gettime(CLOCK_MONOTONIC_COARSE, &last_write_ts_);
-    S3FS_PRN_INFO("append to page,path(%s)offset(%ld),pageoff(%ld)bytes(%lu)",
-        path_.c_str(),offset,offset_,bytes_);
+    S3FS_PRN_INFO(
+        "append to page,path(%s)offset(%ld),pageoff(%ld)bytes(%lu)crcswitch=%u"
+        " bIsSequential=%d",
+        path_.c_str(),offset,offset_,bytes_,gIsCheckCRC,*pbIsSequential);
     return size;
 }
 
-void HwsFdWritePage::Unref()
+void HwsFdWritePage::WritePageUnref()
 {
     if (refs_ > 0)
     {
@@ -394,15 +570,17 @@ HwsFdWritePage* HwsFdWritePageList::NewWritePage(const char *path,
     return newPage;
 }
 
-/*append buf to page list;  
+/*append buf to page list;  pbIsSequential is output para
   must lock write_merge_mutex_ in caller
   return Value: write to page bytes*/
-size_t HwsFdWritePageList::Append(const char *path, const char *buf, off64_t offset, size_t size)
+size_t HwsFdWritePageList::Append(const char *path, const char *buf, off64_t offset, 
+            size_t size,bool* pbIsSequential)
 {
     size_t write_size = 0;
     HwsFdWritePage* newPage = nullptr;
 	HwsFdWritePage* writePage = nullptr;
     unsigned int cur_page_num = pages_.size();
+    bool bIsSequential = true;
     
     do{
         if (IsFull())
@@ -430,12 +608,13 @@ size_t HwsFdWritePageList::Append(const char *path, const char *buf, off64_t off
         }
         
 
-        write_size = writePage->Append(buf,offset,size);
+        write_size = writePage->Append(buf,offset,size,pbIsSequential);
         if (nullptr != newPage)
         {
             pages_.push_back(newPage);
-        }
-    }while(write_size == 0 && !IsFull());
+        }        
+        bIsSequential = *pbIsSequential;
+    }while(write_size == 0 && !IsFull() && bIsSequential);
     return write_size;
 }
 
@@ -558,7 +737,34 @@ HwsFdWritePage* HwsFdWritePageList::OverlapExcludeLastPage(off64_t offset, size_
 
 	return nullptr;
 }
-
+/*if intersect write merge to last page  
+  must lock write_merge_mutex_ in caller*/
+bool HwsFdWritePageList::canIntersectWrtMergeToLastPage(
+        const char* path,off64_t offset, size_t size)
+{
+    if (!g_bIntersectWriteMerge)  //not support intersect write merge
+    {
+        return false;
+    }
+    if (GetCurWrtPageNum() == 0)
+	{
+        // no write page,can copy
+        return true;
+	}
+    bool canMerge = false;
+	HwsFdWritePage* page = pages_.back();
+	if ((page->state_ == HWS_FD_WRITE_STATE_WAIT) &&
+        (offset <= page->offset_ + (off64_t)page->bytes_) &&
+        (offset >= page->offset_))
+	{
+        //intersect with last page,
+        //or sequential with last page(offset equal lastpage offset_ + bytes_)
+        canMerge = true;
+    }
+    S3FS_PRN_INFO("canMerge=%d,path(%s)offset(%ld)size(%lu),pageOff(%lu),pageBytes(%lu)", 
+        canMerge,path, offset,size,page->offset_, page->bytes_);
+    return canMerge;
+}
 /*read overlap from last write page,
   must lock write_merge_mutex_ in caller;
   Return Value: read success size */
@@ -659,7 +865,7 @@ bool HwsFdReadPage::CheckCrcErr(size_t offset, size_t size)
     return false;
 }
 
-void HwsFdReadPage::Unref()
+void HwsFdReadPage::ReadPageUnref()
 {
     if (refs_ > 0)
     {
@@ -671,40 +877,79 @@ void HwsFdReadPage::Unref()
     refs_ = 0;
 }
 
-
+long HwsFdReadStatVec::GetReadStatDiffThreshold()
+{
+    long diffThresholdMs = gReadStatDiffLongMs;
+    
+    off64_t freeCacheSize = HwsFdManager::GetInstance().GetFreeCacheMemSize();
+    //if free size less than 20%,use short diff
+    if (freeCacheSize < gMaxCacheMemSize * gFreeCacheThresholdPercent / 100)
+    {
+        diffThresholdMs = gReadStatDiffShortMs;
+    }
+    return diffThresholdMs;
+}
 void HwsFdReadStatVec::Add(const char* path,
                         off64_t offset, size_t size)
 {
     bool isSequentialOld = isSequential_;
-    if(count_ == 0)
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
+
+    if(stat_.size() == 0)
     {
         clock_gettime(CLOCK_MONOTONIC_COARSE, &first_ts_);
+        memcpy(&last_ts_,&first_ts_,sizeof(struct timespec));            
     }
-    stat_[count_].offset = offset;
-    stat_[count_].size = size;
-    count_++;
-    if(count_ < size_)
+    else
+    {
+        long lastToNowDiffMs = diff_in_ms(&last_ts_, &now_ts);    
+        if (lastToNowDiffMs > gReadStatDiffLongMs)
+        {
+            //too long,clear stat queue and set set first_ts
+            offset_ = 0;
+            stat_.clear();
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &first_ts_);
+            S3FS_DATA_CACHE_PRN_LOG(
+                "too long,lastToNowDiffMs(%ld)path(%s)offset(%ld)",
+                lastToNowDiffMs,path,offset);        
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &last_ts_);
+    HwsFdReadStat stat;
+    stat.offset = offset;
+    stat.size = size;
+    stat_.push_back(stat);
+    if((int)stat_.size() < gReadStatSize)
     {
         return;
     }
 
-	count_ = 0;
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &last_ts_);
-    if(diff_in_ms(&first_ts_, &last_ts_) > time_threshold_)
+    firstToLastDiffMs = diff_in_ms(&first_ts_, &last_ts_);    
+    long diffThresholdMs = GetReadStatDiffThreshold();    
+    off64_t freeCacheSize = HwsFdManager::GetInstance().GetFreeCacheMemSize();
+    if(firstToLastDiffMs > diffThresholdMs)
     {
         //read too slow, don't read ahead
         isSequential_ = false;
         offset_ = 0;
+        stat_.clear();
+        S3FS_DATA_CACHE_PRN_LOG(
+            "too slow not read ahead,path(%s)diff(%ld)threshold(%ld)freecache(%ld)"
+            "lastRead(%ld)",
+            path,firstToLastDiffMs,diffThresholdMs,freeCacheSize,offset);        
         return;
     }
     std::sort(stat_.begin(), stat_.end(),
           [] (HwsFdReadStat const& a, HwsFdReadStat const& b) { return a.offset < b.offset; });
     isSequential_ = false;
     offset_ = 0;
-    //for [8,31],[7,30]...[0,23] to find the last 24 sequential read in a range in 4MB
-    for(int loop = size_ - seq_size_; loop >= 0; loop--)
+    //for [8,31],[7,30]...[0,23] to find the last 24 sequential read in 
+    // a range in gReadStatSizeThreshold(4MB)
+    int seq_size_ = gReadStatSeqSize;
+    for(int loop = gReadStatSize - seq_size_; loop >= 0; loop--)
     {
-        if(stat_[loop+seq_size_-1].offset - stat_[loop].offset <= size_threshold_)
+        if(stat_[loop+seq_size_-1].offset - stat_[loop].offset <= gReadStatSizeThreshold)
         {
             isSequential_ = true;
             offset_ = stat_[loop+seq_size_-1].offset + stat_[loop+seq_size_-1].size;
@@ -713,8 +958,11 @@ void HwsFdReadStatVec::Add(const char* path,
     }
     if (isSequentialOld != isSequential_)
     {
-        S3FS_PRN_INFO("change isSequentia=%d,path(%s)", isSequential_,path);        
+        S3FS_DATA_CACHE_PRN_LOG(
+          "change isSequential=%d,path(%s)readAheadOff(%ld)",
+        isSequential_,path,offset_);        
     }
+    stat_.clear();
 }
 /*must lock read_ahead_mutex_ in caller*/
 off64_t HwsFdReadPageList::GetFirstPageOffset() 
@@ -781,6 +1029,7 @@ int HwsFdReadPageList::Read(const char* path,char *buf, off64_t offset, size_t s
         if((copy_offset >= page->offset_) && (copy_offset < page_end))
         {
             copy_offset_in_page = copy_offset - page->offset_;
+            //page not sequential,break
             if (copied_size > 0 && 0 != copy_offset_in_page)
             {
                 S3FS_PRN_WARN("page not sequential path(%s)offset(%ld)"
@@ -801,53 +1050,156 @@ int HwsFdReadPageList::Read(const char* path,char *buf, off64_t offset, size_t s
             copy_left_size -= page_copy_size;
             hit_page_num++;
             hit_file_offset = page->offset_ + copy_offset_in_page + page_copy_size;
+            page->hitSizeInPage += page_copy_size;
             if(hit_file_offset > hit_max_offset_)
             {
                 SetHitMaxOffset(hit_file_offset);
             }
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &page->last_hit_ts_);            
         }
     }
+    off64_t firstPageOffset = GetFirstPageOffset();
     if (copied_size == size)
     {
-        S3FS_PRN_INFO("read all hit,path(%s) offset(%ld) size(%lu)"
-            "copied(%lu)lastCopy(%lu)hitPage(%u)pageNum(%u)hitoff(%ld)", 
+        S3FS_DATA_CACHE_PRN_LOG("read all hit,path(%s) offset(%ld) size(%lu)"
+            "copied(%lu)lastCp(%lu)hitPg(%u)pgNum(%u)hitoff(%ld)firOff(%ld)ttlHit(%u)", 
             path,offset,size,copied_size,page_copy_size,hit_page_num,cur_page_num,
-            hit_file_offset); 
+            hit_file_offset,firstPageOffset,total_hit_size); 
         g_ReadAllHitNum++;
     }
     else if (0 == copied_size)
     {
-        S3FS_PRN_INFO("read page not hit,path(%s)offset(%ld) size(%lu)"
-            "pageNum(%u)firstOff(%ld)", 
-            path,offset,size,cur_page_num,GetFirstPageOffset());      
+        unsigned int max_page_num = CalcMaxReadPageNum();
+        S3FS_DATA_CACHE_PRN_LOG("read page not hit,path(%s)offset(%ld) size(%lu)"
+            "pgNum(%u)firOff(%ld)maxPg(%u)ttlHit(%u)", 
+            path,offset,size,cur_page_num,firstPageOffset,max_page_num,total_hit_size);      
         g_ReadNotHitNum++;
     }
     else
     {
-        S3FS_PRN_INFO("read page part hit,path(%s) offset(%ld) size(%lu)"
+        S3FS_DATA_CACHE_PRN_LOG("read page part hit,path(%s) offset(%ld) size(%lu)"
             "copy_left_size(%lu) copied_size(%lu) hitPage(%u)pageNum(%u)", 
             path,offset,size,copy_left_size,copied_size,hit_page_num,cur_page_num);      
     }
     total_hit_size += copied_size;
+    lastReadOffset = offset;
     return copied_size;
 }
-
+bool HwsFdReadPageList::PageNeedFree(HwsFdReadPage* page)
+{
+    unsigned int cur_page_num = pages_.size();
+    off64_t cleanPageOffset = 0;
+    /*if hit_max_offset_ beyond page end + 1MB,
+      then set cleanOffset to pageOff + 1MB*/
+    off64_t pageEnd = 
+      (off64_t)(page->offset_ + read_page_size_);
+    if (hit_max_offset_ > (pageEnd + HWS_MB_SIZE))
+    {
+        cleanPageOffset = (off64_t)(page->offset_ + HWS_MB_SIZE);
+    }
+    
+    if (!page->is_read_finish_)
+    {
+        S3FS_DATA_CACHE_PRN_LOG(
+            "break because of not read_finish,path(%s)off(%ld)state(%d)",
+            page->path_.c_str(),page->offset_, page->state_);
+        return false;
+    }
+    
+    if(page->state_ == HWS_FD_READ_STATE_RECVING)
+    {
+        S3FS_DATA_CACHE_PRN_LOG(
+            "break because of READ_STATE_RECVING,path(%s)off(%ld)",
+            page->path_.c_str(),page->offset_);
+        return false;
+    }
+    if (!page->CanRelease())
+    {
+        S3FS_PRN_WARN(
+            "page ref not zero,path(%s)ref(%d)off(%ld)bytes(%lu),pageNum(%u)clnOff(%ld)state_(%d)",
+            page->path_.c_str(), page->refs_, page->offset_,page->read_size_,cur_page_num,
+            cleanPageOffset,page->state_);
+        return false;
+    }
+    //HWS_FD_READ_STATE_DISABLED/HWS_FD_READ_STATE_ERROR return true       
+    if(page->state_ == HWS_FD_READ_STATE_DISABLED || 
+        page->state_ == HWS_FD_READ_STATE_ERROR)
+    {
+        S3FS_PRN_WARN("free disabled or error page,path(%s)off(%ld)state(%d)",
+            page->path_.c_str(),page->offset_, page->state_);
+        return true;
+    }
+    //now state must be RECVED
+    if(page->state_ != HWS_FD_READ_STATE_RECVED)
+    {
+        S3FS_PRN_ERR("free invalid state page,path(%s)off(%ld)state(%d)",
+            page->path_.c_str(),page->offset_, page->state_);
+        return true;
+    }      
+    //if 90% page is hit,and last read offset beyond page end,delete
+    off64_t dataSize = 
+        (page->read_size_ > 0)? page->read_size_:gReadPageSize;
+    off64_t hitPercent = page->hitSizeInPage * 100 / dataSize;
+    if (hitPercent > 90 && lastReadOffset > (pageEnd + HWS_MB_SIZE))
+    {
+        S3FS_DATA_CACHE_PRN_LOG(
+          "free read page,path(%s)off(%ld)hitPer(%ld),lastRead(%ld)pgEnd(%ld)", 
+            page->path_.c_str(), page->offset_,hitPercent,lastReadOffset,pageEnd);
+        return true;
+    }
+    /*1¡¢if page timeout£¬delete
+      2¡¢if page offset less than cleanPageOffset£¬then delete*/ 
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
+    long diffMsRecved = diff_in_ms(&page->got_ts_, &now_ts);
+    long diffMsLastHit = diff_in_ms(&page->last_hit_ts_, &now_ts);
+    long diffMs = min(diffMsRecved,diffMsLastHit);
+    if(diffMs <= gReadPageCleanMs &&
+       (page->offset_ > cleanPageOffset))
+    {
+        S3FS_PRN_INFO(
+            "break,STATE_RECVED,path(%s)diffMs(%ld)threshold(%ld)off(%ld)clnOff(%ld)hitMax(%ld)", 
+            page->path_.c_str(), diffMs,gReadPageCleanMs,page->offset_, 
+            cleanPageOffset,hit_max_offset_);
+        return false;
+    }
+    S3FS_DATA_CACHE_PRN_LOG(
+      "free read page,path(%s)off(%ld)bytes(%lu),pageNum(%u)clnOff(%ld)"
+      "diffRecv(%ld)diffLast(%ld)thres(%ld)hitMax(%ld)hitSz(%ld)", 
+        page->path_.c_str(), page->offset_,page->read_size_,cur_page_num,
+        cleanPageOffset,diffMsRecved,diffMsLastHit,gReadPageCleanMs,
+        hit_max_offset_,page->hitSizeInPage);
+    return true;
+}
 /*clean timeout received page/disabled page/error page;  
   must lock read_ahead_mutex_ in caller*/
 void HwsFdReadPageList::Clean()
-{
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
+{    
     unsigned int cur_page_num = pages_.size();
-
     if (0 == cur_page_num)
     {
+        S3FS_PRN_INFO("cur_page_num = 0");
         return;
     }
-    if (!CheckHitMaxOffset())
+    HwsFdReadPage* first_page = *(pages_.begin());
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
+    //if last clean time to now less than 5 ms,return
+    if (diff_in_ms(&lastCleanTs, &now_ts) < 5)
     {
-        HwsFdReadPage* first_page = *(pages_.begin());
-        
+        if (can_pint_log_with_fc(__LINE__))
+        {
+            S3FS_PRN_WARN("last clean to now time short and return,path(%s)", 
+            first_page->path_.c_str());
+        }
+        S3FS_PRN_DBG("last clean to now time short and return,path(%s)", 
+            first_page->path_.c_str());
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &lastCleanTs);
+    
+    if (!CheckHitMaxOffset())
+    {        
         S3FS_PRN_INFO("hit max invalid,path(%s)hitmax(%ld)pageNum(%u)firstOff(%ld)lastEnd(%ld)", 
             first_page->path_.c_str(),hit_max_offset_,cur_page_num,
             GetFirstPageOffset(),GetLastPageEnd());
@@ -855,52 +1207,23 @@ void HwsFdReadPageList::Clean()
         hit_max_offset_ = GetFirstPageOffset();
         return;
     }
-    off64_t cleanPageOffset = 0;
-    if (hit_max_offset_ < (off64_t)(HWS_MB_SIZE + read_page_size_))
-    {
-        cleanPageOffset = 0;
-    }
-    else
-    {
-        /*clean page offset is hit_max_offset_ - 7MB*/
-        cleanPageOffset = hit_max_offset_ - HWS_MB_SIZE - read_page_size_;
-    }
     auto iter = pages_.begin();
     while(iter != pages_.end())
-    {
+    {        
         HwsFdReadPage* page = *iter;
-        if (!page->is_read_finish_)
+        //print log in pageNeedFree
+        if (PageNeedFree(page))
         {
+            iter = pages_.erase(iter);
+            delete page;
+            HwsFdManager::GetInstance().SubCacheMemSize(read_page_size_);
+        }
+        else
+        {
+            //if first page can not free,break
             break;
         }
-
-        if(page->state_ == HWS_FD_READ_STATE_RECVING)
-        {
-            break;
-        }
-        /*1¡¢if page timeout£¬delete
-          2¡¢if page offset less than cleanPageOffset£¬then delete*/
-        if(page->state_ == HWS_FD_READ_STATE_RECVED &&
-           diff_in_ms(&page->got_ts_, &now_ts) <= time_threshold_ &&
-           (page->offset_ > cleanPageOffset))
-        {
-            break;
-        }
-        if (!page->CanRelease())
-        {
-            S3FS_PRN_WARN("try to release page but ref error,path(%s)ref(%d)off(%ld)bytes(%lu),pageNum(%u)clnOff(%ld)",
-                page->path_.c_str(), page->refs_, page->offset_,page->read_size_,cur_page_num,
-                cleanPageOffset);
-            break;
-        }
-        S3FS_PRN_INFO("free read page,path(%s)off(%ld)bytes(%lu),pageNum(%u)clnOff(%ld)", 
-            page->path_.c_str(), page->offset_,page->read_size_,cur_page_num,
-            cleanPageOffset);
-        iter = pages_.erase(iter);
-        delete page;
-        HwsFdManager::GetInstance().SubCacheMemSize(read_page_size_);
     }
-    return;
 }
 /*read ahead one page 
   must lock read_ahead_mutex_ in caller*/
@@ -908,11 +1231,13 @@ void HwsFdReadPageList::ReadAheadOnePage(const char* path, off64_t offset,
             HwsFdWritePageList& writePage,off64_t fileSize)
 {
     off64_t readAheadOffset = offset;
+    off64_t nextPageOffset = -1;
     
     if (pages_.size() > 0)
     {
         struct HwsFdReadPage *last = pages_.back();
-        readAheadOffset = last->offset_ + last->read_page_size_;
+        nextPageOffset = last->offset_ + last->read_page_size_;
+        readAheadOffset = nextPageOffset;
         if(offset > readAheadOffset)
         {
             readAheadOffset = offset;
@@ -920,7 +1245,7 @@ void HwsFdReadPageList::ReadAheadOnePage(const char* path, off64_t offset,
     }
     if(writePage.IsOverlap(readAheadOffset, read_page_size_))
     {
-        if (can_pint_log_with_fc())
+        if (can_pint_log_with_fc(__LINE__))
         {
             S3FS_PRN_WARN("read ahead overlap write,path(%s)ahead off(%ld)",
                 path, readAheadOffset);
@@ -945,18 +1270,27 @@ void HwsFdReadPageList::ReadAheadOnePage(const char* path, off64_t offset,
     }
     HwsFdManager::GetInstance().AddCacheMemSize(read_page_size_);
     pages_.push_back(newPage);
-    S3FS_PRN_INFO("read ahead one page,path(%s)off(%ld)"
-        "readbeyond(%u),hitsize(%u)",
-        path, readAheadOffset,read_ahead_beyond_filesize_num,total_hit_size);
+    S3FS_DATA_CACHE_PRN_LOG("read ahead one page,path(%s)off(%ld)"
+        "readbeyond(%u),hitsize(%u)firToLast(%ld)inputOff(%ld)nextOff(%ld)",
+        path, readAheadOffset,read_ahead_beyond_filesize_num,total_hit_size,
+        getFirstToLastDiffMs(),offset,nextPageOffset);
 }
 /*calc max page num by total read ahead page num and cache size*/
 unsigned int HwsFdReadPageList::CalcMaxReadPageNum()
 {
     /*if total_hit_size is 0,only read ahead 1 page,
+      if hit 4MB then read ahead 2 page,
       max_page_num increase with total_hit_size*/
-    unsigned int max_page_from_hitsize = 1+ (total_hit_size / read_page_size_);
+    unsigned int max_page_from_hitsize = 
+        1+ ((total_hit_size + 2 * HWS_MB_SIZE) / read_page_size_);
     unsigned int max_page_num = min(max_page_from_hitsize,
         HwsFdManager::GetInstance().GetReadPageNumByCacheSize());
+    if (getFirstToLastDiffMs() > 1000)
+    {
+        //if read slow,max page num not beyond 2
+        unsigned int max_page_slow = 2;
+        max_page_num = min(max_page_num,max_page_slow);
+    }
     return max_page_num;
 }
 
@@ -964,12 +1298,15 @@ unsigned int HwsFdReadPageList::CalcMaxReadPageNum()
   must lock read_ahead_mutex_ in caller*/
 void HwsFdReadPageList::ReadAhead(const char* path, off64_t offset, 
         HwsFdWritePageList& writePage,off64_t fileSize)
-{    
+{        
     HwsFdReadPage* last_page = nullptr;
     /*calc max page num by total read ahead page num and cache size*/
     unsigned int max_page_num = CalcMaxReadPageNum();
-    if(pages_.size() >= max_page_num)
+    unsigned int cur_page_num = pages_.size();
+    if(cur_page_num >= max_page_num)
     {
+        S3FS_PRN_DBG("reach max page,path(%s)curPage(%u)maxPage(%u)",
+            path,cur_page_num,max_page_num);
         return;
     }
     unsigned int new_page_num = max_page_num - pages_.size();
@@ -1071,15 +1408,20 @@ size_t HwsFdEntity::AppendToPageWithRetry(const char *path,
             path, offset);                
         return 0;
     }
-
+    
+    bool bIsSequential = true;
     do 
     {
-        res = writePage_.Append(path_.c_str(), buf, offset, size);
+        res = writePage_.Append(path_.c_str(), buf, offset, size,&bIsSequential);
         if (res == 0)   /*page full*/
         {
+            if (bIsSequential == false)  //not retry for intersect write merge           
+            {
+                break;
+            }
             entity_lock.unlock();
             retryNum++;
-            if (can_pint_log_with_fc())
+            if (can_pint_log_with_fc(__LINE__))
             {
                 S3FS_PRN_WARN("writePage full,retry!path(%s)off(%ld),retry(%ld)", 
                     path, offset,retryNum);                
@@ -1114,19 +1456,26 @@ size_t HwsFdEntity::AppendToPageWithRetry(const char *path,
     /*entity_lock must in lock state when return*/
     return res;
 }
+    
 /*must lock write_merge_mutex_ in caller*/
 bool HwsFdEntity::IsNeedWriteMerge(const char *path, 
     off64_t offset, size_t size, std::unique_lock<std::mutex>& lock)
 {
     int oldWriteMode = curr_write_mode_;
+    bool canIntersectMerge = 
+            writePage_.canIntersectWrtMergeToLastPage(path,offset,size);
     // get current write mode
     if(IsAppend(offset, size))
     {
-            curr_write_mode_ = APPEND;
+        curr_write_mode_ = APPEND;
     }
     else if(IsSequentialModify(offset, size))
     {
-            curr_write_mode_ = MODIFY;
+        curr_write_mode_ = MODIFY;
+    }
+    else if (canIntersectMerge)
+    {
+        curr_write_mode_ = MODIFY;
     }
     else
     {
@@ -1134,11 +1483,17 @@ bool HwsFdEntity::IsNeedWriteMerge(const char *path,
     }
     if (oldWriteMode != curr_write_mode_)
     {
-        S3FS_PRN_INFO("write mode change,path(%s)oldMode(%d)newMode(%d)", 
-            path, oldWriteMode,curr_write_mode_);                  
+        S3FS_PRN_INFO("write mode change,path(%s)off(%ld)oldMode(%d)newMode(%d)", 
+            path,offset,oldWriteMode,curr_write_mode_);                  
+    }
+
+    if (canIntersectMerge)
+    {
+        //if can merge to last page,no need wait flush
+        return true;
     }
     // if not Write-Through, then need decide whether to flush page.
-    if (THROUGH != curr_write_mode_)
+    else if (THROUGH != curr_write_mode_)
     {
         if (!writePage_.IsSequential(offset))
         {
@@ -1245,7 +1600,7 @@ int HwsFdEntity::Read(char* buf, off64_t offset, size_t size, const char* path)
     ChangeFilePathIfNeed(path);
 
     readStat_.Add(path_.c_str(),offset, size);
-    
+    readPage_.setFirstToLastDiffMs(readStat_.getFirstToLastDiffMs());
     /*2,for not break last page merge:
         if overlap with pageList exclude last,flush the overlap page;
         if only right part overlap last page,flush last page;
@@ -1429,7 +1784,7 @@ unsigned int HwsFdManager::GetReadPageNumByCacheSize()
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
     /*print free cache size every 10 seconds*/
-    if (diff_in_ms(&print_free_cache_ts_, &now_ts) > gReadStatTimeThreshold)
+    if (diff_in_ms(&print_free_cache_ts_, &now_ts) > gReadStatDiffLongMs)
     {
         S3FS_PRN_INFO("free cache mem size(%lu)", freeCacheSize);
         clock_gettime(CLOCK_MONOTONIC_COARSE, &print_free_cache_ts_);        
@@ -1528,8 +1883,8 @@ void HwsCacheStatis::PrintStatisNum()
             statis_enum_to_string((hws_cache_statis_type_e)statisEnum),
             statisStru.statisNumArray[statisEnum]);
         ulPrintLen += ulReturnLen;
-        /*if ulPrintLen larger than 100,output*/
-        if (ulPrintLen > 100)            
+        /*if ulPrintLen larger than 200,output*/
+        if (ulPrintLen > 200)            
         {
             S3FS_PRN_WARN("cache statis %s",printStrBuf);
             ulReturnLen         = 0;

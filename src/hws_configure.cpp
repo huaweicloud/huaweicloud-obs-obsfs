@@ -15,17 +15,22 @@
 
 using namespace std;
 
+//extern variable
 extern bool use_obsfs_log;
 extern bool cache_assert;
+extern s3fs_log_level data_cache_log_level;
 extern struct timespec hws_s3fs_start_ts;
 //extern function
 extern long diff_in_ms(struct timespec *start, struct timespec *end);
 extern s3fs_log_level set_s3fs_log_level(s3fs_log_level level);
 
-#define READ_LOG_CONFIGURE_INTERVAL 10
+//global varialbe
 const std::string g_logConfigurePath = "/etc/obsfsconfig";
+s3fs_log_level fuse_intf_log_level;
+
 HwsConfigIntItem_s  g_hwsConfigIntTable[] =
 {
+    //1,debug level and log flow control cfg para
     {
         HWS_CFG_DEBUG_LOG_MODE,
         "dbglogmode",
@@ -42,6 +47,16 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
         5000
     },
     {
+        HWS_CFG_FUSE_INTF_LOG_LEVEL,
+        "fuse_intf_log_level",
+        7
+    },
+    {
+        HWS_CFG_DATA_CACHE_LOG_LEVEL,
+        "obsfs_data_cache_log_level",
+        7
+    },
+    {
         HWS_CFG_CACHE_ASSERT,
         "cacheassert",
         0
@@ -50,8 +65,102 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
         HWS_CFG_COULDNT_RESOLVE_HOST,
         "can_not_resolve_host_retrycnt",
         10
-    }
-    
+    },
+    {
+        HWS_CFG_MAX_PRINT_LOG_NUM_PERIOD,
+        "max_print_log_num_period",
+        3
+    },    
+    {
+        HWS_CFG_STATIS_OPER_LONG_MS,
+        "statis_operate_long_ms",
+        1000
+    },    
+
+    //2,cache cfg para    
+    {
+        HWS_CFG_CACHE_CHECK_CRC_OPEN,
+        "cache_check_crc_open",
+        1
+    },   
+    //default cache attr switch close
+    {
+        HWS_CFG_CACHE_ATTR_SWITCH_OPEN,
+        "cache_attr_switch_open",
+        0
+    },
+    //default cache attr valid is 2 hour
+    {
+        HWS_CFG_CACHE_ATTR_VALID_MS,
+        "cache_attr_valid_ms",
+        7200000
+    },
+    //read page clean after 3 second
+    {
+        HWS_CFG_READ_PAGE_CLEAN_MS,
+        "read_page_clean_ms",
+        3000
+    },
+    //gMaxCacheMemSize(MB)
+    {
+        HWS_CFG_MAX_CACHE_MEM_SIZE_MB,
+        "max_cache_mem_size_mb",
+        1024
+    },
+    //gReadStatDiffLongMs(ms)
+    {
+        HWS_READ_AHEAD_STAT_DIFF_LONG,
+        "read_ahead_stat_diff_long_ms",
+        50000
+    },
+    //gReadStatDiffShortMs(ms),one read 0.2s,24 read need 4.8s,must larger than 4.8s
+    {
+        HWS_READ_AHEAD_STAT_DIFF_SHORT,
+        "read_ahead_stat_diff_short_ms",
+        10000
+    },   
+    //gFreeCacheThresholdPercent,if lower,use gReadStatDiffShortMs
+    {
+        HWS_FREE_CACHE_THRESHOLD_PERCENT,
+        "free_cache_threshold_percent",
+        20
+    },   
+    //gReadStatVecSize
+    {
+        HWS_READ_STAT_VEC_SIZE,
+        "read_stat_vec_size",
+        32
+    },
+    //gReadStatSequentialSize
+    {
+        HWS_READ_STAT_SEQUENTIAL_SIZE,
+        "read_stat_sequential_size",
+        24
+    },    
+    //gReadStatSizeThreshold,default 4MB
+    {
+        HWS_READ_STAT_SIZE_THRESHOLD,
+        "read_stat_size_threshold",
+        4194304
+    },    
+    //g_bIntersectWriteMerge,if merge intersect write to write cache
+    {
+        HWS_INTERSECT_WRITE_MERGE,
+        "intersect_write_merge",
+        0
+    },
+    //gReadPageNum
+    {
+        HWS_READ_PAGE_NUM,
+        "read_page_num",
+        12
+    },
+    //gWritePageNum
+    {
+        HWS_WRITE_PAGE_NUM,
+        "write_page_num",
+        12
+    }    
 };
 
 HwsConfigStrItem_s  g_hwsConfigStrTable[] =
@@ -129,6 +238,7 @@ void HwsConfigure::getStrByParamName(std::string& line,HwsConfigStrItem_s* pConf
 }
 void HwsConfigure::hwsApplyConfigParam()
 {
+    //config log mode default is -1
     if (g_hwsConfigIntTable[HWS_CFG_DEBUG_LOG_MODE].intValue >= 0
         && g_hwsConfigIntTable[HWS_CFG_DEBUG_LOG_MODE].intValue <= (int)LOG_MODE_SYSLOG)
     {
@@ -153,16 +263,19 @@ void HwsConfigure::hwsApplyConfigParam()
                 debug_log_mode = new_log_mode;
             }
         }
-        bool new_cache_assert = 
-            (bool)g_hwsConfigIntTable[HWS_CFG_CACHE_ASSERT].intValue;
-        if (cache_assert != new_cache_assert)
-        {
-            S3FS_PRN_WARN("cache_assert change from %d to %d",
-                cache_assert,new_cache_assert); 
-            cache_assert = new_cache_assert;
-        }
     }
-    setObsFsLogLevel(g_hwsConfigStrTable[HWS_CFG_DEBUG_LEVEL].strValue);       
+    setObsFsLogLevel(g_hwsConfigStrTable[HWS_CFG_DEBUG_LEVEL].strValue);  
+    setFuseIntfLogLevel();
+    set_data_cache_log_level();
+    //set cache assert
+    bool new_cache_assert = 
+        (bool)g_hwsConfigIntTable[HWS_CFG_CACHE_ASSERT].intValue;
+    if (cache_assert != new_cache_assert)
+    {
+        S3FS_PRN_WARN("cache_assert change from %d to %d",
+            cache_assert,new_cache_assert); 
+        cache_assert = new_cache_assert;
+    }
 }
 void HwsConfigure::hwsAnalyseConfigLine_Str(std::string& line)
 {    
@@ -203,7 +316,7 @@ void HwsConfigure::hwsAnalyseConfigLine_Int(std::string& line)
 void HwsConfigure::hwsAnalyseConfigFile(bool analyseIntParam)
 {   
     std::fstream fp(g_logConfigurePath);
-    if (false == fp.is_open())
+    if (NULL == fp)
     {
         S3FS_PRN_DBG("open obsfsconfig failed");
         return;
@@ -258,5 +371,12 @@ void HwsConfigure::setObsFsLogLevel(const char* strlevel)
       S3FS_PRN_WARN("option dbglevel has unknown parameter(%s).", strlevel);
     }
 }
-
+void HwsConfigure::setFuseIntfLogLevel()
+{
+    fuse_intf_log_level = (s3fs_log_level)HwsGetIntConfigValue(HWS_CFG_FUSE_INTF_LOG_LEVEL);
+}
+void HwsConfigure::set_data_cache_log_level()
+{
+    data_cache_log_level = (s3fs_log_level)HwsGetIntConfigValue(HWS_CFG_DATA_CACHE_LOG_LEVEL);
+}
 
