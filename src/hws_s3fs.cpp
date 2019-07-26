@@ -112,6 +112,8 @@ typedef std::map<std::string, kvmap_t>     bucketkvmap_t;
 // Global variables
 //-------------------------------------------------------------------
 s3fs_log_mode debug_log_mode      = LOG_MODE_SYSLOG;
+int           g_LogModeNotObsfs   = 0;
+int           g_backupLogMode     = 0;
 struct timespec hws_s3fs_start_ts;   /*record start time*/
 bool use_obsfs_log                = false;
 bool nomultipart                  = false;
@@ -146,6 +148,7 @@ const char*    s3fs_log_nest[S3FS_LOG_NEST_MAX] = {"", "  ", "    ", "      "};
 bool filter_check_access          = false; // default disable access check
 extern off64_t gMaxCacheMemSize;
 extern bool gIsCheckCRC;
+extern s3fs_log_level data_cache_log_level;
 
 bool cache_assert                 = false;  // default not assert
 std::thread g_thread_daemon_ ;
@@ -200,6 +203,8 @@ static const std::string obsfs_log_file_name   = "obsfs_log";
 
 s3fs_log_level set_s3fs_log_level(s3fs_log_level level);
 extern long diff_in_ms(struct timespec *start, struct timespec *end);
+extern bool can_pint_log_with_fc(int uiLineNum);
+extern unsigned long long getDiffUs(timeval* pBeginTime,timeval* pEndTime);
 //-------------------------------------------------------------------
 // Static functions : prototype
 //-------------------------------------------------------------------
@@ -805,12 +810,14 @@ static int s3fs_readlink(const char* path, char* buf, size_t size)
 {
     S3fsCurl s3fscurl;
     int result;
+    timeval begin_tv;
+    s3fsStatisStart(READLINK_TOTAL, &begin_tv);
 
     if(!path || !buf || 0 >= size)
     {
         return 0;
     }
-    S3FS_PRN_INFO("cmd start: [path=%s]", path);
+    S3FS_INTF_PRN_LOG("cmd start: [path=%s]", path);
 
     // Get file information
     struct stat statBuf;
@@ -852,6 +859,7 @@ static int s3fs_readlink(const char* path, char* buf, size_t size)
     // check buf if it has space words.
     string strTmp = trim(string(buf));
     strcpy(buf, strTmp.c_str());
+    s3fsStatisEnd(READLINK_TOTAL, &begin_tv,path);
 
     S3FS_PRN_INFO("readlink success,[path=%s] size=%u,readsize=%u,fromFile=%s ",
         path,(unsigned int)size,(unsigned int)readsize,buf);
@@ -955,6 +963,8 @@ static int s3fs_symlink(const char* from, const char* to)
     int result;
     struct fuse_context* pcxt;
     struct stat buf;
+    timeval begin_tv;
+    s3fsStatisStart(SYMLINK_TOTAL, &begin_tv);
 
     S3fsCurl s3fscurl(true);
 
@@ -1023,6 +1033,7 @@ static int s3fs_symlink(const char* from, const char* to)
         }
         S3FS_PRN_INFO("symlink WriteBytesToFileObject [to=%s] result=%d",to,result);
     }
+    s3fsStatisEnd(SYMLINK_TOTAL, &begin_tv);
 
     return 0;
 }
@@ -1035,7 +1046,7 @@ static int rename_object(const char* from, const char* to)
   long long inodeNo = INVALID_INODE_NO;
   long long inodeNoCheck = INVALID_INODE_NO;
   bool need_check_to = false;
-  S3FS_PRN_INFO1("[from=%s][to=%s]", from, to);
+  S3FS_INTF_PRN_LOG("[mount_prefix=%s][from=%s][to=%s]", mount_prefix.c_str(), from, to);
 
   if(0 != (result = check_parent_object_access(to, W_OK | X_OK))){
     // not permit writing "to" object parent dir.
@@ -1115,7 +1126,9 @@ static int rename_object(const char* from, const char* to)
 static int s3fs_rename(const char* from, const char* to)
 {
   int result;
-
+  timeval begin_tv;
+  s3fsStatisStart(RENAME_TOTAL, &begin_tv);
+  
   S3FS_PRN_INFO("cmd start: [from=%s][to=%s]", from, to);
 
   if(!nocopyapi && !norenameapi){
@@ -1125,6 +1138,7 @@ static int s3fs_rename(const char* from, const char* to)
     return -1;
   }
   S3FS_MALLOCTRIM(0);
+  s3fsStatisEnd(RENAME_TOTAL, &begin_tv);
 
   return result;
 }
@@ -1143,8 +1157,10 @@ static int s3fs_chmod(const char* path, mode_t mode)
   string nowcache;
   headers_t meta;
   struct stat stbuf;
+  timeval begin_tv;
+  s3fsStatisStart(CHMOD_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][mode=%04o]", path, mode);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][mode=%04o]", path, mode);
 
   if(0 == strcmp(path, "/")){
     S3FS_PRN_WARN("Could not change mode for mount point.");
@@ -1172,6 +1188,9 @@ static int s3fs_chmod(const char* path, mode_t mode)
     return -EIO;
   }
   S3FS_MALLOCTRIM(0);
+  s3fsStatisEnd(CHMOD_TOTAL, &begin_tv,path);
+  // clear attr stat cache
+  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(strpath,0,true);            
 
   return 0;
 }
@@ -1260,8 +1279,10 @@ static int s3fs_chown_hw_obs(const char* path, uid_t uid, gid_t gid)
   string nowcache;
   headers_t meta;
   struct stat stbuf;
+  timeval begin_tv;
+  s3fsStatisStart(CHOWN_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][uid=%u][gid=%u]", path, (unsigned int)uid, (unsigned int)gid);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][uid=%u][gid=%u]", path, (unsigned int)uid, (unsigned int)gid);
 
   if(0 == strcmp(path, "/")){
     S3FS_PRN_WARN("Could not change owner for mount point.");
@@ -1300,6 +1321,10 @@ static int s3fs_chown_hw_obs(const char* path, uid_t uid, gid_t gid)
     return -EIO;
   }
 
+  s3fsStatisEnd(CHOWN_TOTAL, &begin_tv,path);
+  // clear attr stat cache
+  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(strpath,0,true);            
+  
   return 0;
 }
 
@@ -1475,8 +1500,11 @@ static int s3fs_truncate(const char* path, off_t length)
   struct stat statBuf;
   headers_t meta;
   S3fsCurl    s3fscurl(true);
+  string str_path = path;
+  timeval begin_tv;
+  s3fsStatisStart(TRUNCATE_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][length=%jd]", path, (intmax_t)length);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][length=%jd]", path, (intmax_t)length);
 
   if(length < 0){
     length = 0;
@@ -1523,7 +1551,10 @@ static int s3fs_truncate(const char* path, off_t length)
   {
       ent->UpdateFileSizeForTruncate(length);
   }
+  //clear get attr stat after truncate succeed
+  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(str_path,0,true);
 
+  s3fsStatisEnd(TRUNCATE_TOTAL, &begin_tv,path);
   return result;
 }
 
@@ -2128,6 +2159,9 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
 static int s3fs_setxattr(const char* path, const char* name, const char* value, size_t size, int flags)
 #endif
 {
+  timeval begin_tv;
+  s3fsStatisStart(SET_XATTR_TOTAL, &begin_tv);
+    
   S3FS_PRN_INFO("cmd start: [path=%s][name=%s][value=%p][size=%zu][flags=%d]", path, name, value, size, flags);
 
   if((value && 0 == size) || (!value && 0 < size)){
@@ -2179,6 +2213,10 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
     return -EIO;
   }
 
+  s3fsStatisEnd(SET_XATTR_TOTAL, &begin_tv,path);
+  // clear attr stat cache
+  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(strpath,0,true);            
+  
   return 0;
 }
 
@@ -2187,20 +2225,20 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
 #else
 static int s3fs_getxattr(const char* path, const char* name, char* value, size_t size)
 #endif
-{
-  S3FS_PRN_INFO("cmd start: [path=%s][name=%s][value=%p][size=%zu]", path, name, value, size);
-
+{    
+  timeval begin_tv;
+  s3fsStatisStart(GET_XATTR_TOTAL, &begin_tv);
+    
   if(!path || !name){
     return -EIO;
   }
-
 #if defined(__APPLE__)
   if (position != 0) {
     // No resource fork support
     return -EINVAL;
   }
 #endif
-
+  
   int       result;
   headers_t meta;
   xattrs_t  xattrs;
@@ -2254,11 +2292,18 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
   }
   free_xattrs(xattrs);
 
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][name=%s][value=%p][size=%zu],len=%zu",
+    path, name, value, size,length);
+  s3fsStatisEnd(GET_XATTR_TOTAL, &begin_tv,path);
+
   return static_cast<int>(length);
 }
 
 static int s3fs_listxattr(const char* path, char* list, size_t size)
 {
+  timeval begin_tv;
+  s3fsStatisStart(LIST_XATTR_TOTAL, &begin_tv);
+    
   S3FS_PRN_INFO("cmd start: [path=%s][list=%p][size=%zu]", path, list, size);
 
   if(!path){
@@ -2322,11 +2367,15 @@ static int s3fs_listxattr(const char* path, char* list, size_t size)
   }
   free_xattrs(xattrs);
 
+  s3fsStatisEnd(LIST_XATTR_TOTAL, &begin_tv,path);
   return total;
 }
 
 static int s3fs_removexattr(const char* path, const char* name)
 {
+  timeval begin_tv;
+  s3fsStatisStart(REMOVE_XATTR_TOTAL, &begin_tv);
+    
   S3FS_PRN_INFO("cmd start: [path=%s][name=%s]", path, name);
 
   if(!path || !name){
@@ -2401,6 +2450,10 @@ static int s3fs_removexattr(const char* path, const char* name)
 
   free_xattrs(xattrs);
 
+  s3fsStatisEnd(REMOVE_XATTR_TOTAL, &begin_tv,path);
+  // clear attr stat cache
+  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(strpath,0,true);            
+  
   return 0;
 }
 
@@ -2516,6 +2569,9 @@ static void s3fs_destroy(void*)
 
 static int s3fs_access_hw_obs(const char* path, int mask)
 {
+  timeval begin_tv;
+  s3fsStatisStart(ACCESS_TOTAL, &begin_tv);
+    
   S3FS_PRN_INFO("cmd start: [path=%s][mask=%s%s%s%s]", path,
           ((mask & R_OK) == R_OK) ? "R_OK " : "",
           ((mask & W_OK) == W_OK) ? "W_OK " : "",
@@ -2523,6 +2579,7 @@ static int s3fs_access_hw_obs(const char* path, int mask)
           (mask == F_OK) ? "F_OK" : "");
 
   int result = check_object_access(path, mask, NULL, NULL);
+  s3fsStatisEnd(ACCESS_TOTAL, &begin_tv,path);
 
   return result;
 }
@@ -4020,6 +4077,8 @@ static int s3fs_utimens_hw_obs(const char* path, const struct timespec ts[2])
   string nowcache;
   headers_t meta;
   struct stat stbuf;
+  timeval begin_tv;
+  s3fsStatisStart(UTIMENS_TOTAL, &begin_tv);
 
   S3FS_PRN_INFO("cmd start: [path=%s][mtime=%jd]", path, (intmax_t)(ts[1].tv_sec));
 
@@ -4054,6 +4113,10 @@ static int s3fs_utimens_hw_obs(const char* path, const struct timespec ts[2])
     return -EIO;
   }
 
+  s3fsStatisEnd(UTIMENS_TOTAL, &begin_tv,path);
+  // clear attr stat cache
+  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(strpath,0,true);            
+  
   return 0;
 }
 
@@ -4065,8 +4128,115 @@ void get_start_end_content(const char* path,const char* buf,size_t size,off_t of
         S3FS_PRN_INFO("buf content [path=%s][size=%zu][offset=%jd][start=%lx][tail=%lx]", path, size, (intmax_t)offset, pU64_buf[0], pU64_buf_tail[0]);
     }
 }
+void s3fsStatisLogModeNotObsfs()        
+{
+    if (LOG_MODE_OBSFS != debug_log_mode)
+    {
+        g_LogModeNotObsfs++;
+        g_backupLogMode = debug_log_mode;
+    }
+}
 
+//if stGetAttrStat is valid
+bool isCacheGetAttrStatValid(const char* path,tag_index_cache_entry_t* p_cache_entry)        
+{
+    int cfg_cache_attr_open = 
+            HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_SWITCH_OPEN);
+    int cfg_cache_attr_valid_ms = 
+            HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_VALID_MS);
+    if (0 == cfg_cache_attr_open)
+    {
+        S3FS_PRN_DBG("cfg_cache_attr_switch close");
+        return false;
+    }
+    struct timespec nowTime;
 
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &nowTime);
+    struct timespec *pGetAttrMs = &p_cache_entry->getAttrCacheSetTs;
+    long getAttrSetDiffMs = diff_in_ms(pGetAttrMs, &nowTime);
+    S3FS_PRN_INFO("path=%s,attrDiff=%ld,filesize=%ld,cfg_ms=%d", 
+        path,getAttrSetDiffMs,p_cache_entry->stGetAttrStat.st_size,
+        cfg_cache_attr_valid_ms);
+    
+    if (getAttrSetDiffMs < cfg_cache_attr_valid_ms && pGetAttrMs->tv_sec > 0)
+    {
+        //only for statis return true count
+        timeval begin_tv;
+        s3fsStatisStart(CACHE_GET_ATTR_STAT_VALID, &begin_tv);
+        S3FS_DATA_CACHE_PRN_LOG(
+            "hit statCache,path=%s,attrDiff=%ld,cfg_ms=%d,filesize=%ld,mode=%04o", 
+            path,getAttrSetDiffMs,cfg_cache_attr_valid_ms,
+            p_cache_entry->stGetAttrStat.st_size,p_cache_entry->stGetAttrStat.st_mode);
+        s3fsStatisEnd(CACHE_GET_ATTR_STAT_VALID, &begin_tv);
+        return true;
+    }
+    else
+    {
+        return false;        
+    }
+}
+//if cache get attr stat valid and read offset beyond filesize
+bool isReadBeyondCacheStatFileSize(const char* path,tag_index_cache_entry_t* 
+        pIndexEntry,off_t read_offset)
+{
+    off64_t cacheFileSize = pIndexEntry->stGetAttrStat.st_size;
+    
+    S3FS_PRN_INFO("path=%s,cacheFilesize=%ld,readoff=%lu", 
+        path,cacheFileSize,read_offset);
+
+    //if cache get attr stat valid and read offset beyond filesize
+    if (isCacheGetAttrStatValid(path,pIndexEntry)
+        && read_offset >= cacheFileSize)
+    {
+        //only for statis return true count
+        timeval begin_tv;
+        s3fsStatisStart(READ_BEYOND_STAT_FILE_SIZE, &begin_tv);
+        S3FS_DATA_CACHE_PRN_LOG("statCache,beyond size,path=%s,cacheFilesize=%ld,readoff=%lu", 
+            path,cacheFileSize,read_offset);
+        s3fsStatisEnd(READ_BEYOND_STAT_FILE_SIZE, &begin_tv);
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+    
+}
+
+//copy pSrcStat to cache entry and set time before add to entry map
+void copyGetAttrStatToCacheEntry(const char* path,
+    tag_index_cache_entry_t* p_dest_cache_entry,struct stat* pSrcStat)
+{
+    if (pSrcStat->st_size > 0)
+    {
+        memcpy(&(p_dest_cache_entry->stGetAttrStat),pSrcStat,sizeof(struct stat));
+        clock_gettime(CLOCK_MONOTONIC_COARSE, &(p_dest_cache_entry->getAttrCacheSetTs));
+    }
+    else  // perhaps dir,not copy
+    {
+        S3FS_PRN_INFO("path=%s,filesize zero,not copy",path);        
+    }
+}
+//copy cache stat to output para and set output para 
+void copyGetAttrStatFromCacheEntry(string path,
+        tag_index_cache_entry_t* p_src_cache_entry,bool openflag,
+        struct stat* pDestStat,long long* pInodeNo,long* pHeadLastResponseCode)
+{
+    memcpy(pDestStat,&(p_src_cache_entry->stGetAttrStat),sizeof(struct stat));
+    if (pInodeNo)
+    {
+        *pInodeNo = p_src_cache_entry->inodeNo;
+    }
+    if (pHeadLastResponseCode)
+    {
+        *pHeadLastResponseCode = 200;
+    }
+    if (openflag)
+    {
+        IndexCache::getIndexCache()->AddEntryOpenCnt(path);
+    }
+}
+        
 #if 1
 
 static void init_index_cache_entry(tag_index_cache_entry_t &index_cache_entry)
@@ -4079,6 +4249,9 @@ static void init_index_cache_entry(tag_index_cache_entry_t &index_cache_entry)
     index_cache_entry.firstWritFlag   = true;
     index_cache_entry.plogheadVersion = "";
     index_cache_entry.originName  = "";
+
+    memset(&index_cache_entry.stGetAttrStat, 0, sizeof(struct stat));    
+    memset(&index_cache_entry.getAttrCacheSetTs, 0, sizeof(struct timespec));    
 }
 
 int GetIndexCacheEntryWithRetry(string path,tag_index_cache_entry_t* pIndexEntry)
@@ -4152,8 +4325,11 @@ void adjust_filesize_with_write_cache(const char* path,
 }
 
 /* add for object_file_gateway begin */
+//output para:pstbuf,pheader,inodeNo,p_index_cache_entry,
+//            headLastResponseCode(200 for ok)
 static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct stat* pstbuf,
-    headers_t* pmeta, long long* inodeNo, bool openflag, tag_index_cache_entry_t* p_index_cache_entry, long* headLastResponseCode)
+    headers_t* pmeta, long long* inodeNo, bool openflag, tag_index_cache_entry_t* p_index_cache_entry, 
+    long* headLastResponseCode)
 {
     //timeval object_tv;
     //s3fsStatisStart(GETATTR_OBJECT_TOTAL, &object_tv);
@@ -4174,7 +4350,8 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
     }
 
     memset(pstat, 0, sizeof(struct stat));
-    if(0 == strcmp(path, "/") || 0 == strcmp(path, ".")){
+    if(0 == strcmp(path, "/") || 0 == strcmp(path, "."))
+    {
       pstat->st_nlink = 1; // see fuse faq
       pstat->st_mode  = mp_mode;
       pstat->st_uid   = is_s3fs_uid ? s3fs_uid : mp_uid;
@@ -4198,6 +4375,14 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
     s3fsStatisStart(HEAD_DELAY, &begin_tv);
     if (get_ok)
     {
+        //if pmeta is not null,not use cache stat because can not output pmeta
+        if (NULL == pmeta && isCacheGetAttrStatValid(path,p_cache_entry))
+        {
+            //cache entry has valid get attr stat,already print log in isCacheGetAttrStatValid   
+            copyGetAttrStatFromCacheEntry(strpath,p_cache_entry,openflag,pstat,
+                    inodeNo,headLastResponseCode);
+            return 0;
+        }
         result = s3fscurl.HeadRequest(strpath.c_str(), (*pheader), &(p_cache_entry->inodeNo), p_cache_entry->dentryname.c_str());
         if (-ENOENT == result)
         {
@@ -4298,6 +4483,15 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
         // Attention: dir cache key with out / in the end.
         string lruCacheKey = path;
         s3fsStatisStart(GETATTR_PUTINDEX_DELAY, &begin_tv);
+        if (inodeNo)
+        {
+            *inodeNo = p_cache_entry->inodeNo;
+        }
+        pstat->st_ino = p_cache_entry->inodeNo;
+        /*adjust file size with write page list*/
+        adjust_filesize_with_write_cache(path, p_cache_entry->inodeNo,pstat);        
+        //copy pstat to p_cache_entry
+        copyGetAttrStatToCacheEntry(path,p_cache_entry,pstat);
         if (false == openflag)
         {
             result = IndexCache::getIndexCache()->PutIndexNotchangeOpenCnt(lruCacheKey, p_cache_entry);
@@ -4314,16 +4508,9 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
             return -ENOENT;
         }
 
-        if (inodeNo)
-        {
-            *inodeNo = p_cache_entry->inodeNo;
-        }
-        pstat->st_ino = p_cache_entry->inodeNo;
-
-        /*adjust file size with write page list*/
-        adjust_filesize_with_write_cache(path, p_cache_entry->inodeNo,pstat);
-        S3FS_PRN_INFO("get attr hws [path=%s] dentryname(%s) and inodeno(%lld)",
-                      path, p_cache_entry->dentryname.c_str(), p_cache_entry->inodeNo);
+        S3FS_PRN_INFO("get attr hws [path=%s] dentryname(%s) inodeno(%lld)size(%ld)",
+                      path, p_cache_entry->dentryname.c_str(), 
+                      p_cache_entry->inodeNo,pstat->st_size);
         return 0;
     }
     else
@@ -4354,7 +4541,6 @@ void s3fs_set_obsfslog_mode()
 
 static int s3fs_getattr_hw_obs(const char* path, struct stat* pstbuf)
 {
-    S3FS_PRN_INFO("cmd start: [path=%s]", path);
     /*use get attr function set obsfslog mode after 5 seconds after start*/
     s3fs_set_obsfslog_mode();
 
@@ -4370,7 +4556,11 @@ static int s3fs_getattr_hw_obs(const char* path, struct stat* pstbuf)
     }
 
     s3fsStatisEnd(GETATTR_DELAY, &begin_tv);
-    S3FS_PRN_INFO("success [path=%s],mode=%x", path,(unsigned int)pstbuf->st_mode);
+    timeval      end_tv;
+    gettimeofday(&end_tv, NULL);
+    unsigned long long diff = getDiffUs(&begin_tv,&end_tv);
+    S3FS_INTF_PRN_LOG("cmd start: [path=%s],mode=%x,diff=%llu us", 
+        path,(unsigned int)pstbuf->st_mode,diff);
 
     return result;
 }
@@ -4378,7 +4568,7 @@ static int s3fs_getattr_hw_obs(const char* path, struct stat* pstbuf)
 // common function for creation of a plain object
 static int create_file_object_hw_obs(const char* path, mode_t mode, uid_t uid, gid_t gid, long long *inodeNo)
 {
-    S3FS_PRN_INFO2("[path=%s][mode=%04o]", path, mode);
+    S3FS_INTF_PRN_LOG("[path=%s][mode=%04o]", path, mode);
 
     headers_t meta;
     meta["Content-Type"]     = S3fsCurl::LookupMimeType(string(path));
@@ -4451,7 +4641,7 @@ static int s3fs_create_hw_obs(const char* path, mode_t mode, struct fuse_file_in
     struct fuse_context* pcxt;
     long long inodeNo = INVALID_INODE_NO;
     timeval begin_tv;
-    S3FS_PRN_INFO("cmd start: [path=%s][mode=%04o][flags=%d]", path, mode, fi->flags);
+    S3FS_INTF_PRN_LOG("cmd start: [path=%s][mode=%04o][flags=%d]", path, mode, fi->flags);
 
     if(NULL == (pcxt = fuse_get_context())){
       return -EIO;
@@ -4465,15 +4655,26 @@ static int s3fs_create_hw_obs(const char* path, mode_t mode, struct fuse_file_in
         return result;
     }
 
-    result = check_object_access(path, W_OK, NULL, NULL);
-    if(-ENOENT == result)
+    result = check_object_access(path, W_OK, NULL, &inodeNo);
+    if (0 == result)
+    {
+        S3FS_PRN_WARN("file exists, [path=%s]", path);
+        fi->fh = inodeNo;
+        if(!nohwscache)
+        {
+            HwsFdManager::GetInstance().Open(path, inodeNo, 0);
+        }
+        s3fsStatisEnd(CREATE_FILE_TOTAL, &begin_tv);
+        return 0;
+    }
+    else if(-ENOENT == result)
     {
         if(0 != (result = check_parent_object_access(path, W_OK)))
         {
           return result;
         }
     }
-    else if(0 != result)
+    else
     {
         return result;
     }
@@ -4504,7 +4705,7 @@ static int s3fs_open_hw_obs(const char* path, struct fuse_file_info* fi)
     int result = 0;
     long long inodeNo = INVALID_INODE_NO;
     struct stat st;
-    S3FS_PRN_INFO("cmd start: [path=%s][flags=%d]", path, fi->flags);
+    S3FS_INTF_PRN_LOG("cmd start: [path=%s][flags=%d]", path, fi->flags);
 
     timeval begin_tv;
     s3fsStatisStart(OPEN_FILE_TOTAL, &begin_tv);
@@ -4613,9 +4814,6 @@ static int s3fs_write_hw_obs(const char* path,
 {
     int result;
     get_start_end_content(path, buf, size, offset);
-    S3FS_PRN_INFO("cmd start: [path=%s][size=%zu][offset=%jd][fd=%llu]", path, size,
-                                                                        (intmax_t)offset,
-                                                                        (unsigned long long)(fi->fh));
     string str_path = path;
     string dentryname = "";
     string inodeNoStr = toString(fi->fh);
@@ -4663,8 +4861,17 @@ static int s3fs_write_hw_obs(const char* path,
                 result,str_path.c_str(),size,offset);
         return -1;
     }
+    
+    timeval      end_tv;
+    gettimeofday(&end_tv, NULL);
+    unsigned long long diff = getDiffUs(&begin_tv,&end_tv);
+    S3FS_INTF_PRN_LOG("cmd start: [path=%s][size=%zu][offset=%jd][fd=%llu][diff=%llu us]", path, size,
+                                                                        (intmax_t)offset,
+                                                                        (unsigned long long)(fi->fh),diff);
 
     s3fsStatisEnd(WRITE_FILE_TOTAL, &begin_tv,path);
+    //set filesize to cache get attr stat after write succeed
+    IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(str_path,offset+size,false);
     return static_cast<int>(size);
 }
 /* add for object_file_gateway end */
@@ -4686,7 +4893,11 @@ int s3fs_read_hw_obs_proc(const char* path, char* buf, size_t size, off_t offset
         S3FS_PRN_ERR("[path=%s, offset=%ld, size=%zu], getIndex failed", path, (long)offset, size);
         return result;
     }
-
+    else if (isReadBeyondCacheStatFileSize(path,&index_cache_entry,offset))
+    {
+        return 0;
+    }
+    
     if (!index_cache_entry.dentryname.empty())
     {
         dentryname = index_cache_entry.dentryname;
@@ -4719,10 +4930,6 @@ int s3fs_read_hw_obs_proc(const char* path, char* buf, size_t size, off_t offset
 static int s3fs_read_hw_obs(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
     int read_ret_size = 0;
-
-    S3FS_PRN_INFO("cmd start:[path=%s][size=%zu][offset=%jd][fd=%llu],nohwscache=%d",
-        path, size, (intmax_t)offset, (unsigned long long)(fi->fh),nohwscache);
-
     timeval begin_tv;
     s3fsStatisStart(READ_FILE_TOTAL, &begin_tv);
     memset(buf, 0, size);
@@ -4748,7 +4955,13 @@ static int s3fs_read_hw_obs(const char* path, char* buf, size_t size, off_t offs
       return -EIO;
     }
 
-    s3fsStatisEnd(READ_FILE_TOTAL, &begin_tv);
+    s3fsStatisEnd(READ_FILE_TOTAL, &begin_tv,path);
+    timeval      end_tv;
+    gettimeofday(&end_tv, NULL);
+    unsigned long long diff = getDiffUs(&begin_tv,&end_tv);
+    S3FS_INTF_PRN_LOG(
+        "cmd start:[path=%s][size=%zu][offset=%jd][fd=%llu][retsize=%d][diff=%llu us]",
+        path, size, (intmax_t)offset, (unsigned long long)(fi->fh),read_ret_size,diff);
 
     S3FS_PRN_DBG("[path=%s] read success", path);
     if (S3FS_LOG_INFO == debug_level)
@@ -4764,8 +4977,10 @@ static int s3fs_read_hw_obs(const char* path, char* buf, size_t size, off_t offs
 static int s3fs_flush_hw_obs(const char* path, struct fuse_file_info* fi)
 {
   int result = 0;
+  timeval begin_tv;
+  s3fsStatisStart(FLUSH_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
 
   if(!nohwscache)
   {
@@ -4778,18 +4993,23 @@ static int s3fs_flush_hw_obs(const char* path, struct fuse_file_info* fi)
       result = ent->Flush();
   }
 
+  s3fsStatisEnd(FLUSH_TOTAL, &begin_tv,path);
   return result;
 }
 
 static int s3fs_release_hw_obs(const char* path, struct fuse_file_info* fi)
 {
-  S3FS_PRN_INFO("cmd start: [path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
+  timeval begin_tv;
+  s3fsStatisStart(RELEASE_TOTAL, &begin_tv);
+
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
   string tpath = path;
   IndexCache::getIndexCache()->PutIndexReduceOpenCnt(tpath);
   if(!nohwscache)
   {
     HwsFdManager::GetInstance().Close(fi->fh);
   }
+  s3fsStatisEnd(RELEASE_TOTAL, &begin_tv,path);
   return 0;
 }
 
@@ -4798,9 +5018,12 @@ static int s3fs_opendir_hw_obs(const char* path, struct fuse_file_info* fi)
   int result;
   int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK) | X_OK;
   long long inodeNo = INVALID_INODE_NO;
+  timeval begin_tv;
+  s3fsStatisStart(OPENDIR_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][flags=%d] debug_log_mode=%d,cacheassert=%d",
-      path, fi->flags,debug_log_mode,cache_assert);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][flags=%d] debug_log_mode=%d,cacheassert=%d"
+      ",logmodeNotObs=%d,backLogMode=%d",
+      path, fi->flags,debug_log_mode,cache_assert,g_LogModeNotObsfs,g_backupLogMode);
 
   if(0 == (result = check_object_access(path, mask, NULL, &inodeNo))){
     result = check_parent_object_access(path, mask);
@@ -4808,6 +5031,7 @@ static int s3fs_opendir_hw_obs(const char* path, struct fuse_file_info* fi)
 
   fi->fh = inodeNo;
 
+  s3fsStatisEnd(OPENDIR_TOTAL, &begin_tv,path);
   return result;
 }
 
@@ -4815,6 +5039,7 @@ static int s3fs_opendir_hw_obs(const char* path, struct fuse_file_info* fi)
 static int readdir_get_ino(const char* path, struct fuse_file_info* fi, long long& inode_no)
 {
   long long ino = fi->fh;
+  
   if(INVALID_INODE_NO == ino){
     int result = check_object_access(path, X_OK, NULL, &ino);
     if(0 != result){
@@ -4825,6 +5050,7 @@ static int readdir_get_ino(const char* path, struct fuse_file_info* fi, long lon
     ino = gRootInodNo;
   }
   inode_no = ino;
+
   return 0;
 }
 
@@ -4832,11 +5058,12 @@ static int s3fs_readdir_hw_obs(const char* path, void* buf, fuse_fill_dir_t fill
 {
   long long ino;
   int result = readdir_get_ino(path, fi, ino);
+
   if(result != 0){
     return result;
   }
 
-  S3FS_PRN_INFO("cmd start: [path=%s,ino=%lld]", path, ino);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s,ino=%lld]", path, ino);
 
   timeval begin_tv;
 
@@ -4928,7 +5155,7 @@ static int create_directory_object_hw_obs(const char* path, mode_t mode, time_t 
 {
     int result;
 
-    S3FS_PRN_INFO1("[path=%s][mode=%04o][time=%jd][uid=%u][gid=%u]", path, mode, (intmax_t)time, (unsigned int)uid, (unsigned int)gid);
+    S3FS_INTF_PRN_LOG("[path=%s][mode=%04o][time=%jd][uid=%u][gid=%u]", path, mode, (intmax_t)time, (unsigned int)uid, (unsigned int)gid);
 
     if(!path || '\0' == path[0]){
       return -1;
@@ -5006,8 +5233,11 @@ static int s3fs_mkdir_hw_obs(const char* path, mode_t mode)
 {
   int result;
   struct fuse_context* pcxt;
+  timeval begin_tv;
+  s3fsStatisStart(MAKEDIR_TOTAL, &begin_tv);
+  
   mode |= S_IFDIR;
-  S3FS_PRN_INFO("cmd start: [path=%s][mode=%04o]", path, mode);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][mode=%04o]", path, mode);
 
   if(NULL == (pcxt = fuse_get_context())){
     return -EIO;
@@ -5025,8 +5255,7 @@ static int s3fs_mkdir_hw_obs(const char* path, mode_t mode)
   }
 
   result = create_directory_object_hw_obs(path, mode, time(NULL), pcxt->uid, pcxt->gid);
-
-  //S3FS_MALLOCTRIM(0);
+  s3fsStatisEnd(MAKEDIR_TOTAL, &begin_tv,path);
 
   return result;
 }
@@ -5034,6 +5263,9 @@ static int s3fs_mkdir_hw_obs(const char* path, mode_t mode)
 static int s3fs_unlink_hw_obs(const char* path)
 {
   int result;
+  timeval begin_tv;
+  s3fsStatisStart(UNLINK_TOTAL, &begin_tv);
+  
   S3FS_PRN_INFO("cmd start: [path=%s]", path);
 
   // check dir
@@ -5079,6 +5311,7 @@ static int s3fs_unlink_hw_obs(const char* path)
       S3FS_PRN_DBG("delete index cache by unlink [path=%s]", path);
   }
   S3FS_MALLOCTRIM(0);
+  s3fsStatisEnd(UNLINK_TOTAL, &begin_tv,path);
   return result;
 
 }
@@ -5091,8 +5324,10 @@ static int s3fs_rmdir_hw_obs(const char* path)
   long long inodeNo = 0;
   headers_t pmeta;
   bool openflag = false;
+  timeval begin_tv;
+  s3fsStatisStart(RMDIR_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s]", path);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s]", path);
 
   if(0 != (result = check_parent_object_access(path, W_OK | X_OK))){
     return result;
@@ -5119,6 +5354,7 @@ static int s3fs_rmdir_hw_obs(const char* path)
       S3FS_PRN_DBG("delete index cache by rmdir [path=%s]", path);
   }
   S3FS_MALLOCTRIM(0);
+  s3fsStatisEnd(RMDIR_TOTAL, &begin_tv,path);
 
   return result;
 }
@@ -5127,8 +5363,10 @@ static int s3fs_mknod_hw_obs(const char *path, mode_t mode, dev_t rdev)
 {
   int       result;
   struct fuse_context* pcxt;
+  timeval begin_tv;
+  s3fsStatisStart(MAKENODE_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][mode=%04o][dev=%ju]", path, mode, (uintmax_t)rdev);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][mode=%04o][dev=%ju]", path, mode, (uintmax_t)rdev);
 
   if(NULL == (pcxt = fuse_get_context())){
     return -EIO;
@@ -5139,7 +5377,7 @@ static int s3fs_mknod_hw_obs(const char *path, mode_t mode, dev_t rdev)
     S3FS_PRN_ERR("could not create object for special file(result=%d).", result);
     return result;
   }
-
+  s3fsStatisEnd(MAKENODE_TOTAL, &begin_tv,path);
   S3FS_PRN_INFO("mknod [path=%s][mode=%04o][dev=%ju], inode(%llu) ok.", path, mode, (uintmax_t)rdev, inodeNo);
 
   return result;
@@ -5151,8 +5389,10 @@ static int s3fs_mknod_hw_obs(const char *path, mode_t mode, dev_t rdev)
 static int s3fs_fsync_hw_obs(const char* path, int datasync, struct fuse_file_info* fi)
 {
   int result = 0;
+  timeval begin_tv;
+  s3fsStatisStart(FSYNC_TOTAL, &begin_tv);
 
-  S3FS_PRN_INFO("cmd start: [path=%s][fd=%llu][datasync=%d]", path, (unsigned long long)(fi->fh), datasync);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][fd=%llu][datasync=%d]", path, (unsigned long long)(fi->fh), datasync);
 
   if(!nohwscache)
   {
@@ -5165,6 +5405,7 @@ static int s3fs_fsync_hw_obs(const char* path, int datasync, struct fuse_file_in
       result = ent->Flush();
   }
 
+  s3fsStatisEnd(FSYNC_TOTAL, &begin_tv,path);
   return result;
 }
 

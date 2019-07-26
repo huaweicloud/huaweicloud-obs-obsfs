@@ -3830,7 +3830,7 @@ int S3fsCurl::RenameFileOrDirObject(const char *from, const char *to, bool& need
 
     //tmp url for CalcSignatureV2, because osc use decode querystring to CalcSignature
     string turl_tmp = turl;
-    query_string    = "name=" + toString(to) + "&rename";
+    query_string    = "name=" + mount_prefix + toString(to) + "&rename";
     turl           += ("?" + query_string);
     url             = prepare_url(turl.c_str());
     S3FS_PRN_DBG("CalcSignatureV2 [turl=%s],[url=%s]", turl.c_str(), url.c_str());
@@ -3850,7 +3850,7 @@ int S3fsCurl::RenameFileOrDirObject(const char *from, const char *to, bool& need
     type = REQTYPE_POST;
     insertAuthHeaders();
     //real url for post, encode rename_to ,maybe have chinese
-    query_string = "name=" + urlEncode(toString(to)) + "&rename";
+    query_string = "name=" + urlEncode(mount_prefix + toString(to)) + "&rename";
     turl         = turl_tmp + "?" + query_string;
     url          = prepare_url(turl.c_str());
     S3FS_PRN_DBG("real [turl=%s],[url=%s]", turl.c_str(), url.c_str());

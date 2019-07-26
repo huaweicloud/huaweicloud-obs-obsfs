@@ -343,3 +343,8 @@ int main(int argc, char** argv) {
   return RUN_ALL_TESTS();
 }
 
+//only for compile
+void s3fsStatisLogModeNotObsfs()        
+{
+}
+

@@ -54,10 +54,30 @@ enum statis_type_t {
   OPEN_FILE_TOTAL,
   
   LIB_CUR_SEND,
+  READLINK_TOTAL,  
+  MAKENODE_TOTAL,  
+  MAKEDIR_TOTAL,  
+  UNLINK_TOTAL,  
+  RMDIR_TOTAL,  
+  SYMLINK_TOTAL,  
+  RENAME_TOTAL,  
+  CHMOD_TOTAL,  
+  CHOWN_TOTAL,  
+  UTIMENS_TOTAL,  
+  TRUNCATE_TOTAL,  
+  FLUSH_TOTAL,  
+  FSYNC_TOTAL,  
+  RELEASE_TOTAL,  
+  OPENDIR_TOTAL,  
+  ACCESS_TOTAL,  
+  SET_XATTR_TOTAL,  
+  GET_XATTR_TOTAL,  
+  LIST_XATTR_TOTAL,  
+  REMOVE_XATTR_TOTAL,  
+  CACHE_GET_ATTR_STAT_VALID,  
+  READ_BEYOND_STAT_FILE_SIZE,  
   MAX_STEP_STATIS              
 };
-
-#define HWS_STATIS_OPER_LONG_US       1000000   /*if beyond 1000 ms print warn log*/
 
 typedef struct _tag_process_statis {
     unsigned long long costTimes;
