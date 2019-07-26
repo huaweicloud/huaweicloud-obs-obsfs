@@ -1075,6 +1075,8 @@ static int rename_object(const char* from, const char* to)
       return -EIO;
   }
 
+  IndexCache::getIndexCache()->DeleteIndex(toString(from));
+  
   S3fsCurl s3fscurl;
   result = s3fscurl.RenameFileOrDirObject(from, to, need_check_to);
   // rename retry failed, need check [to] whether exist.
