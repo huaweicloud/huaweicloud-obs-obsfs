@@ -40,7 +40,7 @@ endif
 
 obsfs_LDADD = $(DEPS_LIBS)
 
-noinst_PROGRAMS = test_string_util hws_fd_cache_test readdir_marker_map_test
+#noinst_PROGRAMS = test_string_util hws_fd_cache_test readdir_marker_map_test
 
 test_string_util_SOURCES = string_util.cpp test_string_util.cpp test_util.h
 
