@@ -957,7 +957,8 @@ void HwsFdReadStatVec::Add(const char* path,
         }
     }
     if (isSequentialOld != isSequential_)
-    {
+    {
+
         S3FS_DATA_CACHE_PRN_LOG(
           "change isSequential=%d,path(%s)readAheadOff(%ld)",
         isSequential_,path,offset_);        
@@ -1147,8 +1148,8 @@ bool HwsFdReadPageList::PageNeedFree(HwsFdReadPage* page)
             page->path_.c_str(), page->offset_,hitPercent,lastReadOffset,pageEnd);
         return true;
     }
-    /*1¡¢if page timeout£¬delete
-      2¡¢if page offset less than cleanPageOffset£¬then delete*/ 
+    /*1Â¡Â¢if page timeoutÂ£Â¬delete
+      2Â¡Â¢if page offset less than cleanPageOffsetÂ£Â¬then delete*/ 
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
     long diffMsRecved = diff_in_ms(&page->got_ts_, &now_ts);
@@ -1645,7 +1646,7 @@ int HwsFdEntity::Read(char* buf, off64_t offset, size_t size, const char* path)
     /*free writePageReadStru buf*/
     free(writePageLastReadStru.buffer_);
     
-    /*4,read page overlap£¬wait*/
+    /*4,read page overlapÂ£Â¬wait*/
     if(gIsReadWaitCache)
     {
         HwsFdReadPage* readPage = nullptr;
@@ -1741,15 +1742,21 @@ std::shared_ptr<HwsFdEntity> HwsFdManager::Get(const uint64_t inodeNo)
 
 bool HwsFdManager::Close(const uint64_t inodeNo)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    HwsEntityMap::iterator search = fent_.find(inodeNo);
-    if(search == fent_.end()) {
-        return false;
-    }
-    std::shared_ptr<HwsFdEntity> ent = search->second;
-    bool last_reference = ent->Unref();
-    if(last_reference) {
-        fent_.erase(search);
+    // ent keeps a ref to ensure that destructor will not triggered within mutex
+    std::shared_ptr<HwsFdEntity> ent(nullptr);
+    bool last_reference = false;
+    {
+	std::lock_guard<std::mutex> lock(mutex_);
+	HwsEntityMap::iterator search = fent_.find(inodeNo);
+	if(search == fent_.end()) {
+            return false;
+	}
+	
+	ent = search->second;
+	last_reference = ent->Unref();
+	if(last_reference) {
+            fent_.erase(search);
+	}
     }
     return true;
 }
