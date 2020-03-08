@@ -29,7 +29,6 @@
 #include <pthread.h>
 #include <string.h>
 #include <assert.h>
-#include <syslog.h>
 #include <string>
 #include <map>
 #include <vector>

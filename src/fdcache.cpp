@@ -27,7 +27,6 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <syslog.h>
 #include <errno.h>
 #include <string.h>
 #include <assert.h>

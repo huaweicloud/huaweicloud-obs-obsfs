@@ -63,6 +63,7 @@ enum hws_cache_statis_type_e
 {
   TOTAL_READ = 0,      
   READ_HIT,
+  READ_WHOLE_HIT,
   READ_AHEAD_PAGE,   /*read ahead page num*/
   READ_LAST_WRT_PAGE,  /*read from last write page*/
 
@@ -248,7 +249,7 @@ struct HwsFdReadPage
 
     HwsFdReadPage(const char *path, off64_t offset, size_t read_page_size,
                 std::mutex& read_ahead_mutex,
-                void (*thread_task)(HwsFdReadPage*))
+                void (*thread_task)(HwsFdReadPage*) = NULL)
            : path_(path),
              offset_(offset),
              read_page_size_(read_page_size),
@@ -263,10 +264,16 @@ struct HwsFdReadPage
       crc_.reserve(read_page_size/HWS_READ_CRC_SIZE);
       is_read_finish_ = false;
       hitSizeInPage = 0;
-      thread_ = std::thread(thread_task_, this);
+      if (NULL != thread_task_)
+      {
+          thread_ = std::thread(thread_task_, this);
+      }
     }
     ~HwsFdReadPage(){
-        thread_.join();
+        if (NULL != thread_task_)
+        {
+            thread_.join();
+        }
         delete[] data_;
     }
     void GenerateCrc(ssize_t read_size);
@@ -344,6 +351,20 @@ class HwsFdReadPageList
     
 };
 
+struct HwsFdReadWholePageList
+{
+    struct timespec cacheEndTs;
+    std::deque<HwsFdReadPage*> pages_;
+    off64_t cacheHitCnt;
+};
+
+struct HwsFdReadWholeCacheStat
+{
+    struct timespec first_ts;
+    off64_t notHitTimes;
+    off64_t notHitSize;
+};
+
 struct HwsFdReadStat
 {
     off64_t offset;
@@ -382,6 +403,8 @@ class HwsFdEntity
 {
   private:
     int32_t refs_;
+    bool wholeCacheWriteConflict_;
+    bool wholeCacheTaskStarted_;
     std::string path_;
     const long long inodeNo_;
     off64_t fileSize_;
@@ -396,6 +419,8 @@ class HwsFdEntity
     uint32_t sequential_modify_count_;
     int curr_write_mode_;
     off64_t write_end_;   //last write end position
+    HwsFdReadWholeCacheStat wholeCacheStat_;
+    HwsFdReadWholePageList wholeCachePage_;
 
   private:
     bool IsAppend(off64_t offset, size_t size)
@@ -440,9 +465,13 @@ class HwsFdEntity
         write_cache_count = 0;
         write_through_count = 0;
         write_full_count = 0;
-    	curr_write_mode_ = THROUGH;
-    	write_end_ = 0;
-    	sequential_modify_count_ = 0;
+        curr_write_mode_ = THROUGH;
+        write_end_ = 0;
+        sequential_modify_count_ = 0;
+        wholeCachePage_.cacheHitCnt = 0;
+        wholeCacheWriteConflict_ = false;
+        wholeCacheTaskStarted_ = false;
+        ClearWholeReadCacheStatis();
     }
     ~HwsFdEntity(){};
     HwsFdEntity(const HwsFdEntity&) = delete;
@@ -451,11 +480,40 @@ class HwsFdEntity
     void Ref(){
         refs_++;
     }
+
+    int32_t GetRefs()
+    {
+        return refs_;
+    }
     bool Unref(){
         if(refs_ > 0) {
             refs_--;
         }
         return refs_ == 0;
+    }
+    std::string& GetPath()
+    {
+        return path_;
+    }
+    std::mutex& GetEntityMutex()
+    {
+        return entity_mutex_;
+    }
+    HwsFdReadWholePageList& GetReadWholePageList()
+    {
+        return wholeCachePage_;
+    }
+    bool IsWholeWriteConflict()
+    {
+        return wholeCacheWriteConflict_ == true;
+    }
+    void SetWholeCacheStartedFlag(bool flag)
+    {
+        wholeCacheTaskStarted_ = flag;
+    }
+    bool GetWholeCacheStartedFlag()
+    {
+        return wholeCacheTaskStarted_;
     }
     int Write(const char* buf, off64_t offset, size_t size, const char* path = NULL);
     int Flush();
@@ -474,15 +532,53 @@ class HwsFdEntity
         std::lock_guard<std::mutex> entity_lock(entity_mutex_);
         fileSize_ = size;
     }
+
+    void ClearWholeReadCacheStatis()
+    {
+        wholeCacheStat_.notHitSize = 0;
+        wholeCacheStat_.notHitTimes = 0;
+    }
+
+    void ClearWholeReadConflictFlag()
+    {
+        wholeCacheWriteConflict_ = false;
+    }
+
+    void StartWholeFilePreRead(off64_t offset, size_t size);
+    int ReadFromWholeFileCache(const char* path,
+                        char* buf, off64_t offset, size_t size);
+    void CheckPreReadConflict(off64_t offset, size_t size);
 };
 
 typedef std::unordered_map<uint64_t, std::shared_ptr<HwsFdEntity>> HwsEntityMap;
+
+struct HwsFdWholeFileTask
+{
+    long long inode_;
+    std::thread task_;
+
+    HwsFdWholeFileTask(long long inode, void (*thread_task)(long long))
+    {
+        inode_ = inode;
+        task_ = std::thread(thread_task, inode_);
+    }
+
+    ~HwsFdWholeFileTask()
+    {
+        if (task_.joinable())
+        {
+            task_.join();
+        }
+    }
+};
 
 class HwsFdManager
 {
   private:
     HwsEntityMap fent_;
     std::mutex mutex_;
+    std::list<HwsFdWholeFileTask*> wholeFileCacheTasks_;
+    std::mutex cache_mutex_;
     std::atomic<off64_t>  cache_mem_size;      /*write and read page mem size*/
     struct timespec print_free_cache_ts_;      /*print free cache size time*/
     struct timespec prev_check_cache_size_ts_;      /*previous check cache size time*/
@@ -515,6 +611,7 @@ class HwsFdManager
     bool Close(const uint64_t inodeNo);
 
     off64_t GetFreeCacheMemSize();
+    off64_t GetUsedCacheMemSize();
     unsigned int GetWritePageNumByCacheSize();
     unsigned int GetReadPageNumByCacheSize();
     void AddCacheMemSize(uint64_t add_size);
@@ -529,6 +626,8 @@ class HwsFdManager
         thread_ = std::thread(hws_cache_daemon_task);
     }
 
+    void CreateWholeFileCacheTask(long long inode);
+    void DestroyWholeFileCacheTask(bool immediately = false);
 };
 
 typedef struct _tag_hws_cache_statis 

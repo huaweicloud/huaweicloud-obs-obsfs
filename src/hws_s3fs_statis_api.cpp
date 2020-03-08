@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <syslog.h>
 
 #include <string.h>
 #include <string>
@@ -64,8 +63,10 @@ std::string  statis_step[MAX_STEP_STATIS] = {"min_step",
                                              "makedir_total",
                                              "unlink_total",
                                              "rmdir_total",
+                                             "delete_libcurl",
                                              "symlink_total",
                                              "rename_total",
+                                             "rename_libcurl",
                                              "chmod_total",
                                              "chown_total",
                                              "utimens_total",
