@@ -24,7 +24,6 @@
  * A collection of string utilities for manipulating URLs and HTTP responses.
  */
 #include <string.h>
-#include <syslog.h>
 #include <sys/types.h>
 
 #include <string>

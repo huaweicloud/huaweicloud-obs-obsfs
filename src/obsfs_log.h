@@ -1,8 +1,11 @@
 #ifndef __BASE_LOG_H__
 #define __BASE_LOG_H__
 
+#include <string>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+
 
 #ifdef __cplusplus
 #if __cplusplus

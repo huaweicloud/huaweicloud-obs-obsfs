@@ -5,7 +5,7 @@
 
 #define HWS_CONFIG_VALUE_STR_LEN  128
 #define HWS_CONFIG_INVALID_VALUE -1
-#define READ_LOG_CONFIGURE_INTERVAL 10
+#define READ_LOG_CONFIGURE_INTERVAL 5     //every 5 seconds read config file
 #define OBSFS_LOG_MODE_SET_DELAY_MS  5000 /*obs fs log mode set 5000 ms after start*/
 
 extern void hws_configure_task();
@@ -33,6 +33,10 @@ typedef enum
     HWS_CFG_CACHE_ATTR_SWITCH_OPEN, 
     //cache get attr stat valid time
     HWS_CFG_CACHE_ATTR_VALID_MS, 
+    //cache get attr stat valid time for list(ms)
+    HWS_CFG_CACHE_ATTR_VALID_4_LIST_MS,
+    //meta cache capacity
+    HWS_CFG_META_CACHE_CAPACITY,
     //read page clean after 3 second
     HWS_CFG_READ_PAGE_CLEAN_MS, 
     //gMaxCacheMemSize(MB)
@@ -55,7 +59,32 @@ typedef enum
     HWS_READ_PAGE_NUM,
     //gWritePageNum, default 12
     HWS_WRITE_PAGE_NUM, 
-    
+
+    //g_wholeFileCacheSwitch, default false
+    HWS_WHOLE_CACHE_SWITCH,
+    //g_wholeFileCacheMaxMemSize, default 10GB
+    HWS_WHOLE_CACHE_MAX_MEM_SIZE,
+    //g_wholeFileCachePreReadStatisPeriod, default 5 seconds
+    HWS_WHOLE_CACHE_STATIS_PERIOD,
+    //g_wholeFileCacheNotHitTimesPerPeriod, default 300 times
+    HWS_WHOLE_CACHE_READ_TIMES,
+    //g_wholeFileCacheNotHitSizePerPeriod, default 5 MB
+    HWS_WHOLE_CACHE_READ_SIZE,
+    //g_wholeFileCachePreReadInterval, default 50 ms
+    HWS_WHOLE_CACHE_READ_INTERVAL_MS,
+    //g_wholeFileCacheMaxRecycleTime, default 10800 seconds
+    HWS_WHOLE_CACHE_MAX_RECYCLE_TIME,
+    //g_wholeFileCacheMaxHitTimes, default 500000 times
+    HWS_WHOLE_CACHE_MAX_HIT_TIMES,
+    //g_MinReadWritePageByCacheSize
+    HWS_MIN_READ_WRITE_PAGE_BY_CACHE_SIZE,
+
+    //3. other paras
+    //head req with inodeno,default true
+    HWS_REQUEST_WITH_INODENO,
+    //g_listMaxKey, default 110
+    HWS_LIST_MAX_KEY,
+
     HWS_CFG_INT_END
 } HwsConfigIntEnum;
 

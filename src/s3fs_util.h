@@ -104,6 +104,28 @@ class S3ObjList
 };
 /* file gateway modify end */
 
+class S3HwObjList
+{
+  private:
+    typedef std::map<std::string, struct stat> hw_obj_map_t;
+    hw_obj_map_t hw_obj_map;
+  public:
+    S3HwObjList() {}
+    ~S3HwObjList() {}
+
+    hw_obj_map_t::const_iterator begin(void) const {
+      return hw_obj_map.begin();
+    }
+    hw_obj_map_t::const_iterator end(void) const {
+      return hw_obj_map.end();
+    }
+    bool empty() const { return hw_obj_map.empty(); }
+    size_t size() const { return hw_obj_map.size(); }
+    bool insert(std::string& name, struct stat& statBuf);
+
+    S3ObjListStatistic get_statistic() const;
+};
+
 class AutoLock
 {
   private:

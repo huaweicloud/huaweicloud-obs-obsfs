@@ -27,7 +27,6 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <errno.h>
-#include <syslog.h>
 #include <pthread.h>
 #include <assert.h>
 #include <curl/curl.h>
@@ -2805,7 +2804,12 @@ int S3fsCurl::DeleteRequest(const char* tpath)
   curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
   S3fsCurl::AddUserAgent(hCurl);        // put User-Agent
 
-  return RequestPerform();
+  timeval  begin_tv;
+  s3fsStatisStart(DELETE_LIBCURL, &begin_tv);
+  int result = RequestPerform();
+  s3fsStatisEnd(DELETE_LIBCURL, &begin_tv,tpath);
+
+  return result;
 }
 
 //
@@ -2965,7 +2969,11 @@ bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_o
 //              0 - X means SSE-C type and position for SSE-C key(0 is latest key)
 bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* savedpath, int ssekey_pos, long long *inode_no, const char* shardkey)
 {
-    S3FS_PRN_INFO3("[tpath=%s][bpath=%s][save=%s][sseckeypos=%d]", SAFESTRPTR(tpath), SAFESTRPTR(bpath), SAFESTRPTR(savedpath), ssekey_pos);
+    //if req with inodeNo,default true
+    int reqWithInodeNo = HwsGetIntConfigValue(HWS_REQUEST_WITH_INODENO);
+    S3FS_PRN_INFO3("[tpath=%s][bpath=%s][save=%s][sseckeypos=%d]ifWithInode=%d",
+        SAFESTRPTR(tpath), SAFESTRPTR(bpath), SAFESTRPTR(savedpath), ssekey_pos,
+        reqWithInodeNo);
     //timeval begin_tv;
     //s3fsStatisStart(PRE_HEAD_REQUST_DELAY, &begin_tv);
     if(!tpath){
@@ -3021,8 +3029,8 @@ bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* 
 
     string maxDHTViewVersion = toString(getMaxDHTViewVersionId());
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_dht_version, maxDHTViewVersion.c_str());
-
-    if ((NULL != inode_no) && (NULL != shardkey))
+    //if req with inodeNo,default true
+    if (reqWithInodeNo && (NULL != inode_no) && (NULL != shardkey))
     {
         S3FS_PRN_DBG("PreheadRequest with inode_no and shardkey.");
         string str_inode_no = toString(*inode_no);
@@ -3554,7 +3562,10 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
                                               const char *shardkey,
                                               const char *inodeNoStr)
 {
-  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd][ssetype=%d][ssevalue=%s]", SAFESTRPTR(tpath), (intmax_t)start, size, ssetype, ssevalue.c_str());
+  //if req with inodeNo,default true
+  int reqWithInodeNo = HwsGetIntConfigValue(HWS_REQUEST_WITH_INODENO);
+  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd][ssetype=%d][ssevalue=%s]ifWithInode=%d",
+    SAFESTRPTR(tpath), (intmax_t)start, size, ssetype, ssevalue.c_str(),reqWithInodeNo);
 
   if(!tpath || 0 > start || 0 > size){
     return -1;
@@ -3565,8 +3576,17 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
   }
   string resource;
   string turl;
-  path            = "/" + string(inodeNoStr);
-  MakeUrlResource(path.c_str(), resource, turl);
+  //if req with inodeNo,default true
+  if (reqWithInodeNo)
+  {
+      path            = "/" + string(inodeNoStr);
+      MakeUrlResource(path.c_str(), resource, turl);
+  }
+  else
+  {
+      MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);    
+      path            = get_realpath(tpath);
+  }
 
   url             = prepare_url(turl.c_str());
   S3FS_PRN_DBG("[inodeStr=%s],[turl=%s],[url=%s],[path=%s]", inodeNoStr, turl.c_str(), url.c_str(), path.c_str());
@@ -3588,14 +3608,22 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
 
   // "x-hws-s3fs-client", true always
   requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_client, "true");
+  //if req with inodeNo,default true
+  if (reqWithInodeNo)
+  {
+      if (0 != strcmp(shardkey, ""))
+      {
+          requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(shardkey).c_str());
+      }
+  }
+  else
+  {
+      //notify osc:object name use absolute path
+      requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_req_objname_use_path, "true");
+  }
 
   string maxDHTViewVersion = toString(getMaxDHTViewVersionId());
   requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_dht_version, maxDHTViewVersion.c_str());
-
-  if (0 != strcmp(shardkey, ""))
-  {
-      requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(shardkey).c_str());
-  }
 
   op = "GET";
   type = REQTYPE_GET;
@@ -3682,11 +3710,13 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
     string fsVersionId      = toString(fileMeta->fsVersionId);
     string plogHeadVersion  = toString(fileMeta->plogheadVersion);
 	string originName  = fileMeta->originName;
+    //if req with inodeNo,default true
+    int reqWithInodeNo = HwsGetIntConfigValue(HWS_REQUEST_WITH_INODENO);
 
-    S3FS_PRN_INFO3("[inodeNoStr=%s],[shardKey=%s],[write_positon=%s],[size=%jd]", SAFESTRPTR(inodeNoStr.c_str()),
-                                                                       SAFESTRPTR(dentryname.c_str()),
-                                                                       SAFESTRPTR(offsetStr.c_str()),
-                                                                       databuff->ulBufferSize);
+    S3FS_PRN_INFO3("[inodeNoStr=%s],[shardKey=%s],[write_positon=%s],[size=%jd]ifWithInode=%d",
+        SAFESTRPTR(inodeNoStr.c_str()),SAFESTRPTR(dentryname.c_str()),
+           SAFESTRPTR(offsetStr.c_str()),
+           databuff->ulBufferSize,reqWithInodeNo);
     //timeval create_handle_tv;
     //s3fsStatisStart(WRITE_CUR_HANDLE_DELAY, &create_handle_tv);
 
@@ -3702,10 +3732,18 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
     string resource;
     string turl;
     timeval begin_tv;
-    //s3fsStatisStart(WRITE_MAKE_CURL_DELAY, &begin_tv);
-    path            = "/" + inodeNoStr;
-    MakeUrlResource(path.c_str(), resource, turl);
-    //MakeRWUrlResource(inodeNoStr, writeparmname.c_str(), offsetStr.c_str(), resource, turl);
+    //if req with inodeNo,default true
+    if (reqWithInodeNo)
+    {
+        path            = "/" + inodeNoStr;
+        MakeUrlResource(path.c_str(), resource, turl);
+    }
+    else
+    {
+        MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);    
+        path            = get_realpath(tpath);
+    }
+    
 
     turl           += urlargs;
     url             = prepare_url(turl.c_str());
@@ -3742,12 +3780,21 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
 
     // "x-hws-s3fs-client", true always
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_client, "true");
+    
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_connection, "keep-alive");
 
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_obs_meta_mtime, str(time(NULL)).c_str());
-    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_plog_headversion, plogHeadVersion.c_str());
-    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_version_id, fsVersionId.c_str());
-    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_origin_name, urlEncode(originName).c_str());
+    if (reqWithInodeNo)
+    {
+        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_plog_headversion, plogHeadVersion.c_str());
+        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_version_id, fsVersionId.c_str());
+        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_origin_name, urlEncode(originName).c_str());
+    }
+    else
+    {
+        //notify osc:object name use absolute path
+        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_req_objname_use_path, "true");
+    }
 
     string maxDHTViewVersion = toString(getMaxDHTViewVersionId());
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_dht_version, maxDHTViewVersion.c_str());
@@ -3861,7 +3908,10 @@ int S3fsCurl::RenameFileOrDirObject(const char *from, const char *to, bool& need
     S3fsCurl::AddUserAgent(hCurl);                                // put User-Agent
 
     S3FS_PRN_INFO3("uploading... [from=%s][to=%s]", from, to);
+    timeval  begin_tv;
+    s3fsStatisStart(RENAME_LIBCURL, &begin_tv);
     int result = RequestPerform();
+    s3fsStatisEnd(RENAME_LIBCURL, &begin_tv,from);
 	S3FS_PRN_INFO3("s3fs_rename end the result = %d", result);//add by dkz
     delete bodydata;
     bodydata = NULL;

@@ -1,7 +1,6 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
-#include <syslog.h>
 
 #include <cstdint>
 #include <string>
@@ -12,12 +11,15 @@
 
 #include "common.h"
 #include "hws_configure.h"
+#include "hws_index_cache.h"
+
 
 using namespace std;
 
 //extern variable
 extern bool use_obsfs_log;
 extern bool cache_assert;
+extern int gMetaCacheSize;
 extern s3fs_log_level data_cache_log_level;
 extern struct timespec hws_s3fs_start_ts;
 //extern function
@@ -81,7 +83,7 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
     {
         HWS_CFG_CACHE_CHECK_CRC_OPEN,
         "cache_check_crc_open",
-        1
+        0
     },   
     //default cache attr switch close
     {
@@ -95,6 +97,19 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
         "cache_attr_valid_ms",
         7200000
     },
+    //default list cache attr valid is 5s
+    {
+        HWS_CFG_CACHE_ATTR_VALID_4_LIST_MS,
+        "list_cache_attr_valid_ms",
+        5000
+    },
+    //default meta cache capacity is 20000
+    {
+        HWS_CFG_META_CACHE_CAPACITY,
+        "meta_cache_capacity",
+        20000
+    }
+    ,
     //read page clean after 3 second
     {
         HWS_CFG_READ_PAGE_CLEAN_MS,
@@ -160,7 +175,75 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
         HWS_WRITE_PAGE_NUM,
         "write_page_num",
         12
-    }    
+    },
+    //g_wholeFileCacheSwitch
+    {
+        HWS_WHOLE_CACHE_SWITCH,
+        "whole_cache_switch",
+        0
+    },
+    //g_wholeFileCacheMaxMemSize(GB)
+    {
+        HWS_WHOLE_CACHE_MAX_MEM_SIZE,
+        "whole_cache_max_mem_gb",
+        10
+    },
+    //g_wholeFileCachePreReadStatisPeriod(seconds)
+    {
+        HWS_WHOLE_CACHE_STATIS_PERIOD,
+        "whole_cache_statis_period_second",
+        5
+    },
+    //g_wholeFileCacheNotHitTimesPerPeriod
+    {
+        HWS_WHOLE_CACHE_READ_TIMES,
+        "whole_cache_not_hit_times",
+        300
+    },
+    //g_wholeFileCacheNotHitSizePerPeriod(MB)
+    {
+        HWS_WHOLE_CACHE_READ_SIZE,
+        "whole_cache_not_hit_size_mb",
+        5
+    },
+    //g_wholeFileCachePreReadInterval(ms)
+    {
+        HWS_WHOLE_CACHE_READ_INTERVAL_MS,
+        "whole_cache_pre_read_interval_ms",
+        50
+    },
+    //g_wholeFileCacheMaxRecycleTime(seconds)
+    {
+        HWS_WHOLE_CACHE_MAX_RECYCLE_TIME,
+        "whole_cache_recycle_time_second",
+        10800
+    },
+    //g_wholeFileCacheMaxHitTimes
+    {
+        HWS_WHOLE_CACHE_MAX_HIT_TIMES,
+        "whole_cache_max_hit_times_thousand",
+        500
+    },
+    //g_MinReadWritePageByCacheSize
+    {
+        HWS_MIN_READ_WRITE_PAGE_BY_CACHE_SIZE,
+        "min_read_write_page_by_cache_size",
+        0
+    },
+
+    //3. other paras
+    //head req with inodeno,default true
+    {
+        HWS_REQUEST_WITH_INODENO,
+        "request_with_inodeno",
+        1
+    },    
+    //g_listMaxKey
+    {
+        HWS_LIST_MAX_KEY,
+        "list_max_key",
+        110
+    }
 };
 
 HwsConfigStrItem_s  g_hwsConfigStrTable[] =
@@ -275,6 +358,15 @@ void HwsConfigure::hwsApplyConfigParam()
         S3FS_PRN_WARN("cache_assert change from %d to %d",
             cache_assert,new_cache_assert); 
         cache_assert = new_cache_assert;
+    }
+
+    //index cache size
+    if (g_hwsConfigIntTable[HWS_CFG_META_CACHE_CAPACITY].intValue > gMetaCacheSize)
+    {
+        int oldMetaCacheSize = gMetaCacheSize;
+        IndexCache::getIndexCache()->resizeMetaCacheCapacity(g_hwsConfigIntTable[HWS_CFG_META_CACHE_CAPACITY].intValue);
+        S3FS_PRN_WARN("meta cache capacity change from %d to %d",
+                oldMetaCacheSize, gMetaCacheSize);
     }
 }
 void HwsConfigure::hwsAnalyseConfigLine_Str(std::string& line)

@@ -50,6 +50,11 @@ extern unsigned int g_AllocWritePageTimeoutNum;
 extern long gPrintCacheStatisMs;
 extern int gReadStatSize;
 extern int gReadStatSeqSize;
+extern bool g_wholeFileCacheSwitch;
+extern int g_wholeFileCachePreReadInterval;
+extern int g_wholeFileCacheMaxRecycleTime;
+extern off64_t g_wholeFileCacheMaxHitTimes;
+extern off64_t g_MinReadWritePageByCacheSize;
 
 #define WRITE_PAGE_SIZE (6 * 1024 * 1024)
 #define READ_PAGE_SIZE (6 * 1024 * 1024)
@@ -66,7 +71,7 @@ void s3fsStatisLogModeNotObsfs()
 int s3fs_write_hw_obs_proc_test(const char* data, size_t bytes, off64_t offset)
 {
     int out;
-    out = open(TEST_SIMULATE_OSC_FILE, O_WRONLY|O_CREAT);
+    out = open(TEST_SIMULATE_OSC_FILE, O_WRONLY|O_CREAT, 777);
     pwrite(out, data, bytes, offset);
     close(out);
     cout << "send " << bytes << " bytes at offset " << offset << ",bytes=" <<
@@ -102,7 +107,7 @@ int GenerateTemplateFile()
     struct stat stbuf;
     size_t  timespec_size = sizeof(struct timespec);
 
-    fd = open(TEST_TEMPLATE_SRC_FILE, O_RDWR|O_CREAT);
+    fd = open(TEST_TEMPLATE_SRC_FILE, O_RDWR|O_CREAT, 777);
     if(0 > fd)
     {
         return -1;
@@ -248,6 +253,7 @@ namespace {
          gReadStatSeqSize = 6;
          gReadStatDiffLongMs = 1000;
          gReadStatDiffShortMs = 500;
+         g_MinReadWritePageByCacheSize = 1;
       }
 
       void TearDown() override {
@@ -257,6 +263,15 @@ namespace {
 
       // Objects declared here can be used by all tests in the test case for Foo.
     };
+
+    TEST_F(HwsFdCacheTest, HwsFdMultiTimes) {
+        gReadPageSize = READ_PAGE_SIZE;
+        std::shared_ptr<HwsFdEntity> ent0 = HwsFdManager::GetInstance().Open("/home/test", 0, READ_PAGE_SIZE*6);
+        std::shared_ptr<HwsFdEntity> ent1 = HwsFdManager::GetInstance().Open("/home/test", 0, READ_PAGE_SIZE*6);
+        ent0 = HwsFdManager::GetInstance().Get(0);
+        HwsFdManager::GetInstance().Close(0);
+        HwsFdManager::GetInstance().Close(0);
+    }
 
     TEST_F(HwsFdCacheTest, HwsFdManagerFunction) {
         std::shared_ptr<HwsFdEntity> ent0 = HwsFdManager::GetInstance().Open("/home/test", 0, 0);
@@ -1287,6 +1302,56 @@ TEST_F(HwsFdCacheTest, HwsFdReadCheckData001) {
 	HwsFdManager::GetInstance().Close(0);
 }
 
+TEST_F(HwsFdCacheTest, HwsFdWholeCacheCheckData001) {
+    char buf[READ_PAGE_SIZE] = {0};
+    off64_t offset = 0;
+    int loop = 0;
+    int readPageNum = 0;
+    int readBytes = 0;
+    bool bCheckResult = true;
+    off64_t fileSize = 0;
+
+    if (TEST_TEMPLATE_FILE_SIZE/READ_PAGE_SIZE > 2)
+    {
+        readPageNum = TEST_TEMPLATE_FILE_SIZE/READ_PAGE_SIZE -2;
+    }
+    else
+    {
+        EXPECT_EQ(true, false);
+        return;
+    }
+
+    for(loop = 0; loop < (readPageNum+1); loop++, offset += READ_PAGE_SIZE)
+    {
+        readBytes = ReadFromTemplate(buf, READ_PAGE_SIZE, offset,READ_PAGE_SIZE);
+        EXPECT_EQ(readBytes, READ_PAGE_SIZE);
+        s3fs_write_hw_obs_proc_test(buf, READ_PAGE_SIZE, offset);
+        fileSize += READ_PAGE_SIZE;
+    }
+
+    g_wholeFileCacheSwitch = true;
+    g_wholeFileCachePreReadInterval = 10;
+    g_wholeFileCacheMaxRecycleTime = 20;
+    g_wholeFileCacheMaxHitTimes = 1000;
+
+    std::shared_ptr<HwsFdEntity> ent0 = HwsFdManager::GetInstance().Open("/home/test", 0, READ_PAGE_SIZE*readPageNum);
+    ent0 = HwsFdManager::GetInstance().Get(0);
+    offset = 0;
+    for(loop = 0; loop < 1000; loop++) {
+        offset = rand() % (fileSize - 128 * 1024 + 1);
+        ent0->Read(buf, offset, 1024*128);
+        bCheckResult = CheckReadWithTemplate(buf, offset, 1024*128);
+        EXPECT_EQ(bCheckResult, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (ent0->GetWholeCacheStartedFlag())
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+	HwsFdManager::GetInstance().Close(0);
+	HwsFdManager::GetInstance().DestroyWholeFileCacheTask(true);
+}
+
 TEST_F(HwsFdCacheTest, TestFdDynamicPagenum)
 {
     bool bCheckResult = true;
@@ -1591,8 +1656,6 @@ void mock_invalid_read_page(struct HwsFdReadPage* page, int read_size)
         }
     }
 }
-
-
 
 TEST_F(HwsFdCacheTest, HwsInvalidReadPage) {
     {

@@ -127,6 +127,7 @@ std::string writeparmname         = "modify=1&position=";
 std::string endpoint              = "us-east-1";
 std::string cipher_suites         = "";
 const char* hws_s3fs_client       = "x-hws-fs-client";
+const char* hws_s3fs_req_objname_use_path = "x-hws-fs-req-objname-use-path";
 const char* hws_s3fs_connection   = "Connection";
 const char* hws_s3fs_inodeNo      = "x-hws-fs-inodeno";
 const char* hws_s3fs_shardkey     = "x-hws-fs-inode-dentryname";
@@ -142,6 +143,14 @@ const char* hws_obs_meta_uid      = "x-amz-meta-uid";
 const char* hws_obs_meta_gid      = "x-amz-meta-gid";
 const char* hws_obs_meta_mode     = "x-amz-meta-mode";
 
+const char* hws_list_key_size     = "Size";
+const char* hws_list_key_mode     = "Mode";
+const char* hws_list_key_uid      = "Uid";
+const char* hws_list_key_gid      = "Gid";
+const char* hws_list_key_mtime    = "MTime";
+const char* hws_list_key_inode    = "InodeNo";
+const char* hws_list_key_last_modify = "LastModified";
+
 s3fs_log_level debug_level        = S3FS_LOG_WARN;
 const char*    s3fs_log_nest[S3FS_LOG_NEST_MAX] = {"", "  ", "    ", "      "};
 
@@ -149,11 +158,18 @@ bool filter_check_access          = false; // default disable access check
 extern off64_t gMaxCacheMemSize;
 extern bool gIsCheckCRC;
 extern s3fs_log_level data_cache_log_level;
+extern std::atomic<off64_t> g_wholeCacheTotalMemSize;
+extern std::atomic<int> g_wholeCacheReadTasks;
 
 bool cache_assert                 = false;  // default not assert
-std::thread g_thread_daemon_ ;
+std::thread g_thread_daemon_;
+bool g_thread_deamon_start = false;
 bool g_s3fs_start_flag;
 int gCliCannotResolveRetryCount  = 0;
+int gMetaCacheSize = 20000;
+
+const long INVALID_INO = -1;
+const long LIST_MAX_KEY = 110;
 
 
 //-------------------------------------------------------------------
@@ -201,6 +217,7 @@ static const std::string aws_secretkey         = "AWSSecretKey";
 static const std::string obsfs_log_file_path   = "/var/log/obsfs/";
 static const std::string obsfs_log_file_name   = "obsfs_log";
 
+static const char* c_strErrorObjectName = "FILE or SUBDIR in DIR";
 s3fs_log_level set_s3fs_log_level(s3fs_log_level level);
 extern long diff_in_ms(struct timespec *start, struct timespec *end);
 extern bool can_pint_log_with_fc(int uiLineNum);
@@ -214,6 +231,7 @@ static s3fs_log_level bumpup_s3fs_log_level(void);
 static bool is_special_name_folder_object(const char* path);
 static int chk_dir_object_type(const char* path, string& newpath, string& nowpath, string& nowcache, headers_t* pmeta = NULL, dirtype* pDirType = NULL);
 static int remove_old_type_dir(const string& path, dirtype type);
+
 static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t* pmeta = NULL, tag_index_cache_entry_t* p_index_cache_entry = NULL, long* headLastResponseCode = NULL);
 static int check_object_access(const char* path, int mask, struct stat* pstbuf, long long* inodeNo = NULL);
 static int check_object_access_with_openflag(const char* path, int mask, struct stat* pstbuf, long long* inodeNo = NULL, bool openflag = false);
@@ -232,17 +250,34 @@ typedef enum
   FILL_PART,    // the buffer is filled partly
   FILL_FULL     // the buffer is filled full
 }PAGE_FILL_STATE;
-static int readdir_multi_head_hw_obs(const char* path, off_t offset, const S3ObjList& head,
-                void* buf, fuse_fill_dir_t filler, PAGE_FILL_STATE& fill_state, S3ObjListStatistic& fill_statistic);
+
+//static int readdir_multi_head_hw_obs(const char* path, off_t offset, const S3ObjList& head,
+//                void* buf, fuse_fill_dir_t filler, PAGE_FILL_STATE& fill_state, S3ObjListStatistic& fill_statistic);
 static int list_bucket_hw_obs(const char* path, off_t marker_pos,
                 const char* delimiter, int max_keys, long long ino, S3ObjList& head, string& marker);
+static int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& head);
 /* file gateway modify end */
 static int directory_empty(const char* path, long long inodeNo = -1);
 /* file gateway modify begin */
 static int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx,
               const char* ex_contents, const char* ex_key, int isCPrefix, S3ObjList& head);
+
+static int list_bucket_hw_obs_with_optimization(const char* path, const char* delimiter, const string& next_marker, long long ino,
+    S3HwObjList& head, int list_max_key);
+
+static int append_objects_from_xml_with_optimization(const char* path, xmlDocPtr doc, S3HwObjList& head);
+
+static int append_objects_from_xml_ex_with_optimization(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* path, const char* ex_contents, 
+    const char* ex_key,S3HwObjList& head);
+
+static void add_list_result_to_filler(const char* path, string dentryPrefix, S3HwObjList& head, void* buf, off_t offset,
+    fuse_fill_dir_t filler, PAGE_FILL_STATE& fill_state, string& next_marker);
+
+
+
+
+
 /* file gateway modify end */
-static int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& head);
 static bool GetXmlNsUrl(xmlDocPtr doc, string& nsurl);
 static xmlChar* get_base_exp(xmlDocPtr doc, const char* exp);
 static xmlChar* get_prefix(xmlDocPtr doc);
@@ -280,7 +315,12 @@ static int create_file_object_hw_obs(const char* path, mode_t mode, uid_t uid, g
 
 /* add for object_file_gateway begin */
 static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct stat* pstbuf,
-    headers_t* pmeta, long long* inodeNo, bool open_flag, tag_index_cache_entry_t* p_index_cache_entry = NULL, long* headLastResponseCode = NULL);
+    headers_t* pmeta, long long* inodeNo, bool open_flag, tag_index_cache_entry_t* p_index_cache_entry = NULL, long* headLastResponseCode = NULL, 
+    bool useIndexCache = true);
+
+static void parse_one_value_from_node(xmlDocPtr doc, const char* exp, xmlXPathContextPtr ctx, string& value);
+static void parse_value_from_node_with_ns(xmlDocPtr doc, const char* exp, xmlXPathContextPtr ctx, string& value);
+
 /* add for object_file_gateway end */
 
 
@@ -1074,9 +1114,20 @@ static int rename_object(const char* from, const char* to)
       S3FS_PRN_ERR("[from=%s]The src of rename is not existed , return err", from);
       return -EIO;
   }
+  //flush src data to osc
+  //if not found,then file not open,no need to flush
+  if (get_ok)
+  {
+	  std::shared_ptr<HwsFdEntity> ent = HwsFdManager::GetInstance().Get(inodeNo);
+	  if (ent)
+	  {
+	    ent->Flush();
+	  }
+  }
 
+  //delete "from" cache, if rename faild but trans success, then cache_attr_switch_open is wrong
   IndexCache::getIndexCache()->DeleteIndex(toString(from));
-  
+
   S3fsCurl s3fscurl;
   result = s3fscurl.RenameFileOrDirObject(from, to, need_check_to);
   // rename retry failed, need check [to] whether exist.
@@ -1086,18 +1137,8 @@ static int rename_object(const char* from, const char* to)
           result = 0;
       }
   }
-  S3FS_PRN_INFO1("RenameFileOrDirObject() end [result=%d]", result);
-
-  //flush src data to osc
-  //if not found,then file not open,no need to flush
-  if (get_ok)
-  {
-	  std::shared_ptr<HwsFdEntity> ent = HwsFdManager::GetInstance().Get(index_cache_entry.inodeNo);
-	  if (ent)
-	  {
-	    ent->Flush();
-	  }
-  }
+  S3FS_PRN_INFO1("RenameFileOrDirObject end,[from=%s][to=%s] [result=%d]",
+      from,to,result);
 
   tag_index_cache_entry_t to_cache_entry;
   init_index_cache_entry(to_cache_entry);
@@ -1541,6 +1582,7 @@ static int s3fs_truncate(const char* path, off_t length)
   }
 
   string query_string = "length=" + toString(length) + "&truncate";
+  meta[hws_obs_meta_mtime] = str(time(NULL)).c_str();
   if(0 != (result = s3fscurl.PutHeadRequest(path, meta, false, query_string)))
   {
       S3FS_PRN_ERR("truncate failed [path=%s] length=%u,result=%x",
@@ -1573,7 +1615,7 @@ static int s3fs_statfs(const char* path, struct statvfs* stbuf)
   return 0;
 }
 
-
+#if 0
 /* file gateway modify begin */
 /*对list_bucket_hw_obs的结果发head请求*/
 static int readdir_multi_head_hw_obs(
@@ -1626,6 +1668,75 @@ static int readdir_multi_head_hw_obs(
 
   S3FS_PRN_INFO("[fill end][path=%s,off=%ld,fill=(state:%d,content:%s)]",
       path, offset, fill_state, fill_statistic.to_string().c_str());
+  return 0;
+}
+
+#endif
+
+static int list_bucket_hw_obs_with_optimization(
+                const char*     path,
+                const char*     delimiter,
+                const string&   next_marker,
+                long long       ino,
+                S3HwObjList&    head,
+                int             list_max_key)
+{
+
+  int       result = 0;
+  string    ino_str = toString(ino);
+  string    query_delimiter = "";
+  string    query_marker = "";
+  string    query_max_keys = "";
+  string    query_prefix = "";
+  string    each_query = "";
+  S3fsCurl  s3fscurl;
+  xmlDocPtr doc;
+  BodyData* body = nullptr;
+
+  S3FS_PRN_INFO1("[list begin][path=%s,next_marker=%s]",
+      path, next_marker.c_str());
+
+  // delimiter
+  if(delimiter && 0 < strlen(delimiter)){
+    query_delimiter = string("delimiter=") + delimiter + "&";
+  }
+  // marker
+  if(!next_marker.empty()){
+    string marker = ino_str + "/" + next_marker;
+    query_marker = string("marker=") + urlEncode(marker) + "&";
+  }
+
+  // max-keys
+  query_max_keys = string("max-keys=") + toString(list_max_key) + "&";
+  // prefix
+  query_prefix = "prefix=" + ino_str;
+  // query filter composed of delimiter, marker, maxkey and prefix
+  each_query = query_delimiter + query_marker + query_max_keys + query_prefix;
+
+  // request one batch of path names */
+  result = s3fscurl.ListBucketRequest(path, each_query.c_str());
+  if(0 != result){
+    S3FS_PRN_ERR("[path=%s,marker=%s] ListBucketRequest returns with error %d.",
+        path, next_marker.c_str(), result);
+    return result;
+  }
+  body = s3fscurl.GetBodyData();
+
+  // xmlDocPtr
+  if(NULL == (doc = xmlReadMemory(body->str(), static_cast<int>(body->size()), "", NULL, 0))){
+    S3FS_PRN_ERR("[path=%s,marker=%s] xmlReadMemory returns with error.",
+        path, next_marker.c_str());
+    return -1;
+  }
+
+  // extract list result from documents.
+  if(0 != append_objects_from_xml_with_optimization(path, doc, head)){
+    S3FS_PRN_ERR("[path=%s,marker=%s] append_objects_from_xml returns with error.",
+        path, next_marker.c_str());
+    xmlFreeDoc(doc);
+    return -1;
+  }
+  xmlFreeDoc(doc);
   return 0;
 }
 
@@ -1707,7 +1818,290 @@ static int list_bucket_hw_obs(
 }
 
 
-static const char* c_strErrorObjectName = "FILE or SUBDIR in DIR";
+static void parse_one_value_from_node(xmlDocPtr doc, const char* exp, xmlXPathContextPtr ctx, string& value)
+{
+    string xmlnsurl;
+    string exp_string = "";
+    if(!noxmlns && GetXmlNsUrl(doc, xmlnsurl)){
+        xmlXPathRegisterNs(ctx, (xmlChar*)"s3", (xmlChar*)xmlnsurl.c_str());
+        exp_string += "s3:";
+    }
+
+    exp_string += exp;
+    return parse_value_from_node_with_ns(doc, exp_string.c_str(), ctx, value);
+}
+
+static void parse_value_from_node_with_ns(xmlDocPtr doc, const char* exp, xmlXPathContextPtr ctx, string& value)
+{
+    xmlXPathObjectPtr marker_xp;
+    if(NULL == (marker_xp = xmlXPathEvalExpression((xmlChar*)exp, ctx))){
+      return;
+    }
+    if(xmlXPathNodeSetIsEmpty(marker_xp->nodesetval)){
+      xmlXPathFreeObject(marker_xp);
+      return;
+    }
+    xmlNodeSetPtr key_nodes = marker_xp->nodesetval;
+
+    // get data in childrenNode
+    xmlChar*      result = xmlNodeListGetString(doc, key_nodes->nodeTab[0]->xmlChildrenNode, 1);
+    value = (result ? (char*)result : "");
+    xmlXPathFreeObject(marker_xp);
+    xmlFree(result);
+
+    return;
+}
+
+
+static char* extract_object_name_for_show(const char* path, const char* fullpath)
+{
+  // Make dir path and filename
+  string   strdirpath = mydirname(string((char*)fullpath));
+  string   strmybpath = mybasename(string((char*)fullpath));
+  const char* dirpath = strdirpath.c_str();
+  const char* mybname = strmybpath.c_str();
+  const char* basepath= (path && '/' == path[0]) ? &path[1] : path;
+
+
+  if(!mybname || '\0' == mybname[0]){
+    return NULL;
+  }
+
+  // check subdir & file in subdir
+  if(dirpath && 0 < strlen(dirpath)){
+    // case of "/"
+    if(0 == strcmp(mybname, "/") && 0 == strcmp(dirpath, "/")){
+      return (char*)c_strErrorObjectName;
+    }
+    // case of "."
+    if(0 == strcmp(mybname, ".") && 0 == strcmp(dirpath, ".")){
+      return (char*)c_strErrorObjectName;
+    }
+    // case of ".."
+    if(0 == strcmp(mybname, "..") && 0 == strcmp(dirpath, ".")){
+      return (char*)c_strErrorObjectName;
+    }
+    // case of "name"
+    if(0 == strcmp(dirpath, ".")){
+      // OK
+      return strdup(mybname);
+    }else{
+      if(basepath && 0 == strcmp(dirpath, basepath)){
+        // OK
+        return strdup(mybname);
+      }else if(basepath && 0 < strlen(basepath) && '/' == basepath[strlen(basepath) - 1] && 0 == strncmp(dirpath, basepath, strlen(basepath) - 1)){
+        string withdirname = "";
+        if(strlen(dirpath) > strlen(basepath)){
+          withdirname = &dirpath[strlen(basepath)];
+        }
+        if(0 < withdirname.length() && '/' != withdirname[withdirname.length() - 1]){
+          withdirname += "/";
+        }
+        withdirname += mybname;
+        return strdup(withdirname.c_str());
+      }
+    }
+  }
+  return (char*)c_strErrorObjectName;
+}
+
+
+
+static int parse_obj_name_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* ex_key, const char* path, string& obj_name)
+{
+    string dentry_name = "";
+    parse_value_from_node_with_ns(doc, ex_key, ctx, dentry_name);
+    if (dentry_name.empty())
+    {
+        S3FS_PRN_ERR("path %s, ex_key %s name not exist.", path, ex_key);
+        return -1;
+    }
+
+    char* pure_name = extract_object_name_for_show(path, dentry_name.c_str());
+    if (!pure_name)
+    {
+        S3FS_PRN_ERR("path %s, name %s is invalid.", path, dentry_name.c_str());
+           return -1;
+    }
+
+    if((const char*)pure_name == c_strErrorObjectName){
+      S3FS_PRN_ERR("path %s, name %s is file or subdir in dir. but continue.", path, dentry_name.c_str());
+      return -1;
+    }
+
+    obj_name = pure_name;
+    free(pure_name);
+
+    return 0;
+}
+static mode_t parse_mode_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+{
+    headers_t::const_iterator iter;
+
+    string mode_val = "";
+    parse_one_value_from_node(doc, hws_list_key_mode, ctx, mode_val);
+    if (mode_val.empty())
+    {
+        return 0;
+    }
+
+    return get_mode(mode_val.c_str());
+}
+
+static long parse_ino_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+{
+    string ino_str = "";
+    parse_one_value_from_node(doc, hws_list_key_inode, ctx, ino_str);
+    if (ino_str.empty())
+    {
+        return INVALID_INO;
+    }
+    return atol(ino_str.c_str());
+}
+
+static uid_t parse_uid_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+{
+    string uid = "";
+    parse_one_value_from_node(doc, hws_list_key_uid, ctx, uid);
+    if (uid.empty())
+    {
+        return 0;
+    }
+
+    return get_uid(uid.c_str());
+}
+
+static gid_t parse_gid_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+{
+    string gid = "";
+    parse_one_value_from_node(doc, hws_list_key_gid, ctx, gid);
+    if (gid.empty())
+    {
+        return 0;
+    }
+
+    return get_gid(gid.c_str());
+}
+
+static off_t parse_size_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+{
+    string size = "";
+    parse_one_value_from_node(doc, hws_list_key_size, ctx, size);
+    if (size.empty())
+    {
+        return 0;
+    }
+
+    return get_size(size.c_str());
+}
+
+static time_t parse_mtime_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+{
+    string mtime_str = "";
+    parse_one_value_from_node(doc, hws_list_key_mtime, ctx, mtime_str);
+
+    if (mtime_str.empty())
+    {
+        return 0;
+    }
+
+    return get_mtime(mtime_str.c_str());
+}
+
+
+static int parse_stat_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, struct stat* pstat, const char* path, const char* name)
+{
+    memset(pstat, 0, sizeof(struct stat));
+
+    long inode_no = parse_ino_from_node(doc, ctx);
+    if (INVALID_INO == inode_no)
+    {
+        S3FS_PRN_ERR("path %s, name %s, inode not in element.", path, name);
+        return -1;
+    }
+
+    time_t mtime = parse_mtime_from_node(doc, ctx);
+    if (mtime == 0)
+    {
+        S3FS_PRN_ERR("path %s, name %s, node not in element.", path, name);
+        return -1;
+    }
+
+    mode_t mode = parse_mode_from_node(doc, ctx);
+    if (mode == 0)
+    {
+        S3FS_PRN_ERR("path %s, name %s, mode not in element.", path, name);
+        return -1;
+    }
+
+    off_t size = parse_size_from_node(doc, ctx);
+    uid_t uid = parse_uid_from_node(doc, ctx);
+    gid_t gid = parse_gid_from_node(doc, ctx);
+
+    pstat->st_ino = inode_no;
+    pstat->st_nlink = 1;
+    pstat->st_mode = mode;
+    pstat->st_size = size;
+
+    if(S_ISREG(pstat->st_mode)){
+        pstat->st_blocks = get_blocks(pstat->st_size);
+    }
+    pstat->st_blksize = 4096;
+
+    pstat->st_uid = uid;
+    pstat->st_gid = gid;
+    pstat->st_mtime = mtime;
+    return 0;
+}
+
+
+static int append_objects_from_xml_ex_with_optimization(
+    xmlDocPtr           doc,
+    xmlXPathContextPtr  ctx,
+    const char*         path,
+    const char*         ex_contents,
+    const char*         ex_key,
+    S3HwObjList&        head)
+{
+  xmlXPathObjectPtr contents_xp;
+  xmlNodeSetPtr content_nodes;
+
+  if(NULL == (contents_xp = xmlXPathEvalExpression((xmlChar*)ex_contents, ctx))){
+    S3FS_PRN_ERR("xmlXPathEvalExpression returns null.");
+    return -1;
+  }
+  if(xmlXPathNodeSetIsEmpty(contents_xp->nodesetval)){
+    S3FS_XMLXPATHFREEOBJECT(contents_xp);
+    return 0;
+  }
+  content_nodes = contents_xp->nodesetval;
+
+  int    result = 0;
+  for(int i = 0; i < content_nodes->nodeNr; i++){
+    ctx->node = content_nodes->nodeTab[i];
+
+    string obj_name = "";
+    if ((result = parse_obj_name_from_node(doc, ctx, ex_key, path, obj_name)) != 0){
+      break;
+    }
+
+    struct stat statBuf;
+    if ((result = parse_stat_from_node(doc, ctx, &statBuf, path, obj_name.c_str())) != 0){
+      break;
+    }
+
+    if ((result = (head.insert(obj_name, statBuf) ? 0 : -1)) !=0){
+        S3FS_PRN_ERR("insert object returns with error, name is empty! path %s", path);
+        break;
+    };
+
+  }
+  S3FS_XMLXPATHFREEOBJECT(contents_xp);
+
+  return result;
+}
+
+
 
 static int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx,
        const char* ex_contents, const char* ex_key, int isCPrefix, S3ObjList& head)
@@ -1803,6 +2197,59 @@ static bool GetXmlNsUrl(xmlDocPtr doc, string& nsurl)
   }
   return result;
 }
+
+// Extract list result from xml, add put result to S3HwObjList.
+static int append_objects_from_xml_with_optimization(
+    const char*      path,
+    xmlDocPtr        doc,
+    S3HwObjList&     head)
+{
+  string xmlnsurl;
+  string ex_contents = "//";
+  string ex_key      = "";
+  string ex_cprefix  = "//";
+  string ex_prefix   = "";
+
+  if(!doc){
+    return -1;
+  }
+
+  // If there is not <Prefix>, use path instead of it.
+  xmlChar* pprefix = get_prefix(doc);
+  string   prefix  = (pprefix ? (char*)pprefix : path ? path : "");
+  if(pprefix){
+    xmlFree(pprefix);
+  }
+
+  xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
+
+  if(!noxmlns && GetXmlNsUrl(doc, xmlnsurl)){
+    xmlXPathRegisterNs(ctx, (xmlChar*)"s3", (xmlChar*)xmlnsurl.c_str());
+    ex_contents+= "s3:";
+    ex_key     += "s3:";
+    ex_cprefix += "s3:";
+    ex_prefix  += "s3:";
+  }
+  // Contents-Key (files in current directory)
+  ex_contents+= "Contents";
+  ex_key     += "Key";
+  // CommonPrefixes-Prefix (directories in current directory)
+  ex_cprefix += "CommonPrefixes";
+  ex_prefix  += "Prefix";
+
+  // Parse Contents(files) and CommonPrefixes(directory) separately.
+  if(-1 == append_objects_from_xml_ex_with_optimization(doc, ctx, prefix.c_str(), ex_contents.c_str(), ex_key.c_str(), head) ||
+     -1 == append_objects_from_xml_ex_with_optimization(doc, ctx, prefix.c_str(), ex_cprefix.c_str(), ex_prefix.c_str(), head))
+  {
+    S3FS_PRN_ERR("append_objects_from_xml_ex returns with error.");
+    S3FS_XMLXPATHFREECONTEXT(ctx);
+    return -1;
+  }
+  S3FS_XMLXPATHFREECONTEXT(ctx);
+
+  return 0;
+}
+
 
 /* file gateway modify begin */
 static int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& head)
@@ -2545,6 +2992,7 @@ static void* s3fs_init(struct fuse_conn_info* conn)
   #endif
 
   g_thread_daemon_ = std::thread(hws_daemon_task);
+  g_thread_deamon_start = true;
 
   return NULL;
 }
@@ -2552,6 +3000,7 @@ static void* s3fs_init(struct fuse_conn_info* conn)
 static void s3fs_destroy(void*)
 {
   S3FS_PRN_INFO("destroy");
+
 
   // Destroy curl
   if(!S3fsCurl::DestroyS3fsCurl()){
@@ -2566,6 +3015,11 @@ static void s3fs_destroy(void*)
 
   //stop all thread
   g_s3fs_start_flag = false;
+  if (g_thread_deamon_start && g_thread_daemon_.joinable())
+  {
+      S3FS_PRN_INFO("ak sk deamon thread join");  
+      g_thread_daemon_.join();
+  }
   DisableLogService();
 }
 
@@ -4041,6 +4495,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         {
             gMaxCacheMemSize = maxCacheSize;
         }
+        S3FS_PRN_WARN("maxCacheSize = %ld", gMaxCacheMemSize);
         return 0;
       }
     if(0 == strcmp(arg, "obsfslog")){
@@ -4139,44 +4594,82 @@ void s3fsStatisLogModeNotObsfs()
     }
 }
 
-//if stGetAttrStat is valid
-bool isCacheGetAttrStatValid(const char* path,tag_index_cache_entry_t* p_cache_entry)        
+// copy cache stat to output para and set output para
+void fillGetAttrStatInfoFromCacheEntry(tag_index_cache_entry_t* p_src_cache_entry, struct stat* pDestStat)
 {
-    int cfg_cache_attr_open = 
-            HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_SWITCH_OPEN);
-    int cfg_cache_attr_valid_ms = 
-            HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_VALID_MS);
-    if (0 == cfg_cache_attr_open)
+    memcpy(pDestStat,&(p_src_cache_entry->stGetAttrStat),sizeof(struct stat));
+}
+
+void afterCopyFromCacheEntryProcess(
+    const char* path, long long* pInodeNo,long* pHeadLastResponseCode, tag_index_cache_entry_t* p_src_cache_entry, bool openflag)
+{
+    if (pInodeNo)
     {
-        S3FS_PRN_DBG("cfg_cache_attr_switch close");
+        *pInodeNo = p_src_cache_entry->inodeNo;
+    }
+    if (pHeadLastResponseCode)
+    {
+        *pHeadLastResponseCode = 200;
+    }
+    if (openflag)
+    {
+        IndexCache::getIndexCache()->AddEntryOpenCnt(path);
+    }
+}
+
+
+//if stGetAttrStat is valid
+bool isCacheGetAttrStatValid(const char* path, tag_index_cache_entry_t* p_cache_entry)
+{
+    // try to get attr (getattr command may be caused by readdir)
+    struct timespec *pGetAttrMs = &p_cache_entry->getAttrCacheSetTs;
+    if (pGetAttrMs->tv_sec <= 0)
+    {
         return false;
     }
-    struct timespec nowTime;
 
+    struct timespec nowTime;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &nowTime);
-    struct timespec *pGetAttrMs = &p_cache_entry->getAttrCacheSetTs;
-    long getAttrSetDiffMs = diff_in_ms(pGetAttrMs, &nowTime);
-    S3FS_PRN_INFO("path=%s,attrDiff=%ld,filesize=%ld,cfg_ms=%d", 
-        path,getAttrSetDiffMs,p_cache_entry->stGetAttrStat.st_size,
-        cfg_cache_attr_valid_ms);
     
-    if (getAttrSetDiffMs < cfg_cache_attr_valid_ms && pGetAttrMs->tv_sec > 0)
+    long getAttrSetDiffMs = diff_in_ms(pGetAttrMs, &nowTime);
+
+    int cfg_cache_attr_valid_ms = 0;
+    if (HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_SWITCH_OPEN))
     {
-        //only for statis return true count
-        timeval begin_tv;
-        s3fsStatisStart(CACHE_GET_ATTR_STAT_VALID, &begin_tv);
-        S3FS_DATA_CACHE_PRN_LOG(
-            "hit statCache,path=%s,attrDiff=%ld,cfg_ms=%d,filesize=%ld,mode=%04o", 
-            path,getAttrSetDiffMs,cfg_cache_attr_valid_ms,
-            p_cache_entry->stGetAttrStat.st_size,p_cache_entry->stGetAttrStat.st_mode);
-        s3fsStatisEnd(CACHE_GET_ATTR_STAT_VALID, &begin_tv);
-        return true;
+        if (S_ISDIR(p_cache_entry->stGetAttrStat.st_mode))
+        {
+            cfg_cache_attr_valid_ms = HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_VALID_4_LIST_MS);
+        }
+        else
+        {
+            cfg_cache_attr_valid_ms = HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_VALID_MS);
+        }
     }
     else
     {
-        return false;        
+        // If switch is close, attr need to be within list attr valid time
+        cfg_cache_attr_valid_ms = HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_VALID_4_LIST_MS);
     }
+
+    // If value is beyond the validity period, not use it.
+    if (getAttrSetDiffMs >= cfg_cache_attr_valid_ms)
+    {
+        return false;
+    }
+
+    //only for statis return true count
+    timeval begin_tv;
+    s3fsStatisStart(CACHE_GET_ATTR_STAT_VALID, &begin_tv);
+    S3FS_DATA_CACHE_PRN_LOG(
+        "hit statCache,path=%s,attrDiff=%ld,cfg_ms=%d,filesize=%ld,mode=%04o",
+        path, getAttrSetDiffMs, cfg_cache_attr_valid_ms,
+        p_cache_entry->stGetAttrStat.st_size, p_cache_entry->stGetAttrStat.st_mode);
+    s3fsStatisEnd(CACHE_GET_ATTR_STAT_VALID, &begin_tv);
+
+    return true;
+
 }
+
 //if cache get attr stat valid and read offset beyond filesize
 bool isReadBeyondCacheStatFileSize(const char* path,tag_index_cache_entry_t* 
         pIndexEntry,off_t read_offset)
@@ -4206,38 +4699,34 @@ bool isReadBeyondCacheStatFileSize(const char* path,tag_index_cache_entry_t*
 }
 
 //copy pSrcStat to cache entry and set time before add to entry map
-void copyGetAttrStatToCacheEntry(const char* path,
-    tag_index_cache_entry_t* p_dest_cache_entry,struct stat* pSrcStat)
+void copyStatToCacheEntry(const char* path,
+    tag_index_cache_entry_t* p_dest_cache_entry, struct stat* pSrcStat, CACHE_STAT_TYPE statType)
 {
+    memcpy(&(p_dest_cache_entry->stGetAttrStat),pSrcStat,sizeof(struct stat));
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &(p_dest_cache_entry->getAttrCacheSetTs));
+
+    p_dest_cache_entry->statType = statType;
+}
+
+void copyGetAttrStatToCacheEntry(
+    const char* path, tag_index_cache_entry_t* p_dest_cache_entry, struct stat* pSrcStat)
+{
+    if (0 == HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_SWITCH_OPEN))
+    {
+        return;
+    }
+
     if (pSrcStat->st_size > 0)
     {
-        memcpy(&(p_dest_cache_entry->stGetAttrStat),pSrcStat,sizeof(struct stat));
-        clock_gettime(CLOCK_MONOTONIC_COARSE, &(p_dest_cache_entry->getAttrCacheSetTs));
+        copyStatToCacheEntry(path, p_dest_cache_entry, pSrcStat, STAT_TYPE_HEAD);
     }
-    else  // perhaps dir,not copy
+    else
     {
-        S3FS_PRN_INFO("path=%s,filesize zero,not copy",path);        
+        S3FS_PRN_INFO("path=%s,filesize zero,not copy",path);
     }
 }
-//copy cache stat to output para and set output para 
-void copyGetAttrStatFromCacheEntry(string path,
-        tag_index_cache_entry_t* p_src_cache_entry,bool openflag,
-        struct stat* pDestStat,long long* pInodeNo,long* pHeadLastResponseCode)
-{
-    memcpy(pDestStat,&(p_src_cache_entry->stGetAttrStat),sizeof(struct stat));
-    if (pInodeNo)
-    {
-        *pInodeNo = p_src_cache_entry->inodeNo;
-    }
-    if (pHeadLastResponseCode)
-    {
-        *pHeadLastResponseCode = 200;
-    }
-    if (openflag)
-    {
-        IndexCache::getIndexCache()->AddEntryOpenCnt(path);
-    }
-}
+
+
         
 #if 1
 
@@ -4252,6 +4741,8 @@ static void init_index_cache_entry(tag_index_cache_entry_t &index_cache_entry)
     index_cache_entry.plogheadVersion = "";
     index_cache_entry.originName  = "";
 
+    index_cache_entry.statType = STAT_TYPE_BUTT;
+
     memset(&index_cache_entry.stGetAttrStat, 0, sizeof(struct stat));    
     memset(&index_cache_entry.getAttrCacheSetTs, 0, sizeof(struct timespec));    
 }
@@ -4261,13 +4752,14 @@ int GetIndexCacheEntryWithRetry(string path,tag_index_cache_entry_t* pIndexEntry
     int          result = 0;
 
     bool hit_index = IndexCache::getIndexCache()->GetIndex(path, pIndexEntry);
-    if (hit_index)
+    // if plogHeadVersion is empty(cache add by list), send head to osc
+    if (hit_index && !pIndexEntry->plogheadVersion.empty())
     {
         return 0;
     }
     S3FS_PRN_INFO("[path=%s] getIndex failed and retry", path.c_str());
     result = get_object_attribute_with_open_flag_hw_obs(path.c_str(), NULL, NULL, NULL,
-        false, pIndexEntry);
+        false, pIndexEntry, NULL, false);
     if (0 != result)
     {
         S3FS_PRN_ERR("[path=%s] getIndex retry get attr failed", path.c_str());
@@ -4331,7 +4823,7 @@ void adjust_filesize_with_write_cache(const char* path,
 //            headLastResponseCode(200 for ok)
 static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct stat* pstbuf,
     headers_t* pmeta, long long* inodeNo, bool openflag, tag_index_cache_entry_t* p_index_cache_entry, 
-    long* headLastResponseCode)
+    long* headLastResponseCode, bool useIndexCache)
 {
     //timeval object_tv;
     //s3fsStatisStart(GETATTR_OBJECT_TOTAL, &object_tv);
@@ -4362,7 +4854,6 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
 	  pstat->st_size = mp_st_size;
       return 0;
     }
-    s3fsStatisStart(GETATTR_GETINDEX_DELAY, &begin_tv);
 
     /* firstly, find inodeNo from index cache */
     tag_index_cache_entry_t index_cache_entry;
@@ -4370,25 +4861,32 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
     tag_index_cache_entry_t* p_cache_entry = p_index_cache_entry ? p_index_cache_entry : &index_cache_entry;
     // LRU cache key without / in the end
     strpath     = path;
-    bool get_ok = IndexCache::getIndexCache()->GetIndex(strpath, p_cache_entry);
 
+    
+    s3fsStatisStart(GETATTR_GETINDEX_DELAY, &begin_tv);
+    bool get_ok = IndexCache::getIndexCache()->GetIndex(strpath, p_cache_entry);
     s3fsStatisEnd(GETATTR_GETINDEX_DELAY, &begin_tv);
 
     s3fsStatisStart(HEAD_DELAY, &begin_tv);
     if (get_ok)
     {
-        //if pmeta is not null,not use cache stat because can not output pmeta
-        if (NULL == pmeta && isCacheGetAttrStatValid(path,p_cache_entry))
+        if (useIndexCache)
         {
-            //cache entry has valid get attr stat,already print log in isCacheGetAttrStatValid   
-            copyGetAttrStatFromCacheEntry(strpath,p_cache_entry,openflag,pstat,
-                    inodeNo,headLastResponseCode);
-            return 0;
+            //if pmeta is not null,not use cache stat because can not output pmeta
+            if (NULL == pmeta && isCacheGetAttrStatValid(path,p_cache_entry))
+            {
+                fillGetAttrStatInfoFromCacheEntry(p_cache_entry, pstat);
+                // do after process: copy inodeNo, set response code, add open count if need.
+                afterCopyFromCacheEntryProcess(path, inodeNo, headLastResponseCode, p_cache_entry, openflag);
+
+                return 0;
+            }
         }
+
         result = s3fscurl.HeadRequest(strpath.c_str(), (*pheader), &(p_cache_entry->inodeNo), p_cache_entry->dentryname.c_str());
         if (-ENOENT == result)
         {
-            /* 发生覆盖写场景后带的inode可能是旧的被覆盖的文件，做一次重试 */
+            /* may re-upload occurs, inode belongs to old file, use path to retry again */
             S3FS_PRN_WARN("[path=%s] may overwrite, so remove indexcache and getattr again without inode(%lld).",
                 strpath.c_str(), p_cache_entry->inodeNo);
 
@@ -4400,6 +4898,7 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
     {
         result = s3fscurl.HeadRequest(strpath.c_str(), (*pheader));
     }
+
     if (headLastResponseCode)
     {
         *headLastResponseCode = s3fscurl.GetLastResponseCode();
@@ -4908,6 +5407,24 @@ int s3fs_read_hw_obs_proc(const char* path, char* buf, size_t size, off_t offset
     std::string inodeNoStr = toString(index_cache_entry.inodeNo);
 
     result = s3fscurl.ReadFromFileObject(path, buf, offset, size, dentryname.c_str(), inodeNoStr.c_str());
+    if (404 == s3fscurl.GetLastResponseCode())
+    {
+        S3FS_PRN_WARN("[path=%s, offset=%ld, size=%zu, dentryname=%s, inode=%s] read return 404, try head it",
+            path, (long)offset, size, dentryname.c_str(), inodeNoStr.c_str());
+        IndexCache::getIndexCache()->DeleteIndex(toString(path));
+        if(0 == GetIndexCacheEntryWithRetry(str_path,&index_cache_entry))
+        {
+            inodeNoStr = toString(index_cache_entry.inodeNo);
+            dentryname = index_cache_entry.dentryname;
+            result = s3fscurl.ReadFromFileObject(path, buf, offset, size, dentryname.c_str(), inodeNoStr.c_str());
+        }
+        else
+        {
+            S3FS_PRN_ERR("[path=%s, offset=%ld, size=%zu, dentryname=%s, inode=%s] read return 404, and try head failed",
+                path, (long)offset, size, dentryname.c_str(), inodeNoStr.c_str());
+            return -ENOENT;
+        }
+    }
     if (0 > result)
     {
         /*modify for object_file_gateway begin*/
@@ -5056,6 +5573,7 @@ static int readdir_get_ino(const char* path, struct fuse_file_info* fi, long lon
   return 0;
 }
 
+
 static int s3fs_readdir_hw_obs(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi)
 {
   long long ino;
@@ -5065,7 +5583,11 @@ static int s3fs_readdir_hw_obs(const char* path, void* buf, fuse_fill_dir_t fill
     return result;
   }
 
-  S3FS_INTF_PRN_LOG("cmd start: [path=%s,ino=%lld]", path, ino);
+  char buffer[sizeof(int64_t)*8 + 1];
+  sprintf(buffer, "%lld", ino);
+  string dentryPrefix = std::string(buffer) + "/";
+
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s,ino=%lld, offset=%ld]", path, ino, offset);
 
   timeval begin_tv;
 
@@ -5088,47 +5610,36 @@ static int s3fs_readdir_hw_obs(const char* path, void* buf, fuse_fill_dir_t fill
     fill_state = FILL_PART;
   }
 
+  int list_max_key = HwsGetIntConfigValue(HWS_LIST_MAX_KEY);
   // Fill current page until the buffer is full or there is no more data from bucket.
   do {
-    const int max_keys = 1000;
-    S3ObjList head;
 
-    // Get one batch of object names
+    // Use S3HwObjList to sort files and directories.
+    S3HwObjList head;
+
     s3fsStatisStart(LIST_BUCKET, &begin_tv);
-    result = list_bucket_hw_obs(path, marker_pos, "/", max_keys, ino, head, next_marker);
-    if(result != 0){
+
+    // Get one batch of list result
+    result = list_bucket_hw_obs_with_optimization(path, "/", next_marker, ino, head, list_max_key);
+	s3fsStatisEnd(LIST_BUCKET, &begin_tv, path);
+	if(result != 0){
       S3FS_PRN_ERR("[ino=%lld,path=%s,off=%ld,marker[%ld]=%s] list_bucket_hw_obs returns error(%d).",
           ino, path, offset, marker_pos, next_marker.c_str(), result);
       (void)marker_remove(ino, path, marker_pos);
       return result;
     }
-    s3fsStatisEnd(LIST_BUCKET, &begin_tv, path);
+
+    S3FS_PRN_INFO1("[list end][path=%s,off=%ld,list_info=%s]",
+      path, marker_pos, head.get_statistic().to_string().c_str());
+   
     if(head.empty()){
       // there is no more data from obs, finish the list operation.
       break;
     }
 
-    // Send multi head request for stats caching.
-    string strpath = path;
-    if(strcmp(path, "/") != 0 && '/' == strpath[strpath.length() - 1]){
-      strpath = strpath.substr(0, strpath.length() - 1);
-    }
+    // fill list result to filler, and put stat to index cache
+    add_list_result_to_filler(path, dentryPrefix, head, buf, marker_pos, filler, fill_state, next_marker);
 
-    S3ObjListStatistic fill_statistic;
-    result = readdir_multi_head_hw_obs(strpath.c_str(), marker_pos, head, buf, filler, fill_state, fill_statistic);
-    if(0 != result){
-      // Failed to stat objects.
-      S3FS_PRN_ERR("[ino=%lld,path=%s,off=%ld,marker[%ld]=%s] readdir_multi_head returns error(%d).",
-          ino, path, offset, marker_pos, next_marker.c_str(), result);
-      (void)marker_remove(ino, path, marker_pos);
-      return result;
-    }
-
-    // update marker for next batch.
-    string last_name = fill_statistic.get_last_name();
-    if (!last_name.empty()) {
-      next_marker = last_name;
-    }
   }while(fill_state != FILL_FULL);
 
   // Succeeded to stat objects:
@@ -5151,7 +5662,54 @@ static int s3fs_readdir_hw_obs(const char* path, void* buf, fuse_fill_dir_t fill
       ino, path, offset, marker_pos, next_marker.c_str());
   return 0;
 }
-/* file gateway modify end */
+
+static void add_list_result_to_filler(const char* path, string dentryPrefix, S3HwObjList& head, void* buf, off_t offset, fuse_fill_dir_t filler, PAGE_FILL_STATE& fill_state, string& next_marker)
+{
+    string strpath = path;
+    if (strcmp(path, "/") != 0 && '/' != strpath[strpath.length() - 1]){
+        strpath += "/";
+    }
+
+    bool is_full = false;
+    for (auto it = head.begin(); it != head.end(); it++){
+        is_full = filler(buf, it->first.c_str(), &(it->second), offset);
+        if (is_full)
+        {
+            fill_state = FILL_FULL;
+            break;
+        }
+
+        fill_state = FILL_PART;
+        next_marker = it->first;
+
+        // dispath, head path
+        string dispath = strpath + it->first;
+
+        // add to index cache
+        tag_index_cache_entry_t index_cache_entry;
+        init_index_cache_entry(index_cache_entry);
+
+        index_cache_entry.inodeNo = it->second.st_ino;
+        index_cache_entry.dentryname = dentryPrefix + it->first;
+
+        std::shared_ptr<HwsFdEntity> ent = HwsFdManager::GetInstance().Get(index_cache_entry.inodeNo);
+        if (ent != nullptr)
+        {
+            off64_t fileSize = ent->GetFileSize();
+            index_cache_entry.stGetAttrStat.st_size = max(fileSize, it->second.st_size);
+        }
+        
+        copyStatToCacheEntry(dispath.c_str(), &index_cache_entry, const_cast<struct stat*>(&(it->second)), STAT_TYPE_LIST);
+
+        IndexCache::getIndexCache()->PutIndexNotchangeOpenCnt(dispath, &index_cache_entry);
+
+        S3FS_PRN_INFO2("[offset=%ld,filename=%s,filemode=%o,filesize=%llu,uid=%ld,gid=%ld,mtime=%s]",
+          offset, it->first.c_str(), it->second.st_mode, (long long)it->second.st_size, (long)it->second.st_uid, (long)it->second.st_gid, ctime(&it->second.st_mtime));
+
+    }
+
+    return;
+}
 
 static int create_directory_object_hw_obs(const char* path, mode_t mode, time_t time, uid_t uid, gid_t gid)
 {
@@ -5479,6 +6037,9 @@ int main(int argc, char* argv[])
   // init syslog(default CRIT)
   openlog("s3fs", LOG_PID | LOG_ODELAY | LOG_NOWAIT, LOG_USER);
   set_s3fs_log_level(debug_level);
+
+  g_wholeCacheReadTasks.store(0);
+  g_wholeCacheTotalMemSize.store(0);
 
   // init xml2
   xmlInitParser();

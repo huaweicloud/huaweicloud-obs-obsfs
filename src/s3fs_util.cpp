@@ -27,7 +27,6 @@
 #include <sys/stat.h>
 #include <pwd.h>
 #include <grp.h>
-#include <syslog.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -130,6 +129,32 @@ S3ObjListStatistic S3ObjList::get_statistic() const {
   return list_info;
 }
 /* file gateway modify end */
+
+
+//-------------------------------------------------------------------
+// Class S3ObjList
+//-------------------------------------------------------------------
+bool S3HwObjList::insert(std::string& name, struct stat& statBuf){
+  if(name.empty()){
+    // Ignore empty name.
+    return false;
+  }
+
+  // Insert pair into map.
+  hw_obj_map.emplace(name, statBuf);
+  return true;
+}
+
+S3ObjListStatistic S3HwObjList::get_statistic() const {
+  S3ObjListStatistic list_info;
+  if(!empty()){
+    list_info.set_size(hw_obj_map.size());
+    list_info.set_first(hw_obj_map.begin()->first);
+    list_info.set_last(hw_obj_map.rbegin()->first);
+  }
+  return list_info;
+}
+
 
 //-------------------------------------------------------------------
 // Class AutoLock

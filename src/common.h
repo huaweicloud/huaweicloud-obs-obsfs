@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #include "../config.h"
 #include "obsfs_log.h"
+#include <syslog.h>
+#include <map>
 
 //
 // Extended attribute
@@ -41,6 +43,13 @@
 //
 static inline const char *SAFESTRPTR(const char *strptr) { return strptr ? strptr : ""; }
 
+typedef enum
+{
+  STAT_TYPE_HEAD = 0, // stat info is added by head
+  STAT_TYPE_LIST,     // stat info is added by list
+  STAT_TYPE_BUTT
+}CACHE_STAT_TYPE;
+
 //
 // Struct
 //
@@ -51,7 +60,8 @@ typedef struct _tag_index_cache_entry {
     std::string plogheadVersion;
     std::string fsVersionId;
     bool        firstWritFlag;
-    std::string originName;
+    CACHE_STAT_TYPE statType;
+    std::string     originName;
     struct timespec getAttrCacheSetTs;   //time when set stGetAttrStat
     struct stat     stGetAttrStat;       //cache get attr stat
 }tag_index_cache_entry_t;
@@ -231,6 +241,7 @@ extern const char*    s3fs_log_nest[S3FS_LOG_NEST_MAX];
 
 /* file gateway modify begin */
 extern const char*    hws_s3fs_client;
+extern const char*    hws_s3fs_req_objname_use_path;
 extern const char*    hws_s3fs_inodeNo;
 extern const char*    hws_s3fs_shardkey;
 extern const char*    hws_s3fs_connection;
