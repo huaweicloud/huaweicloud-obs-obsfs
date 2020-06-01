@@ -65,23 +65,6 @@ If you encounter any errors, enable debug output:
 obsfs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd -o dbglevel=info -f -o curldbg
 ```
 
-If you use obsfs with a non-Amazon S3 implementation, specify the URL and path-style requests:
-
-```
-obsfs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd -o url=http://url.to.s3/ -o use_path_request_style
-```
-
-or(fstab)
-```
-obsfs#mybucket /path/to/mountpoint fuse _netdev,allow_other,use_path_request_style,url=http://url.to.s3/ 0 0
-```
-
-To use IBM IAM Authentication, use the `-o ibm_iam_auth` option, and specify the Service Instance ID and API Key in your credentials file:
-```
-echo SERVICEINSTANCEID:APIKEY > /path/to/passwd
-```
-The Service Instance ID is only required when using the `-o create_bucket` option.
-
 Note: You may also want to create the global credential file first
 
 ```
