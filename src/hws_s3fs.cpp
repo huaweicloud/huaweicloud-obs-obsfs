@@ -1617,7 +1617,7 @@ static int s3fs_statfs(const char* path, struct statvfs* stbuf)
 
 #if 0
 /* file gateway modify begin */
-/*¶Ôlist_bucket_hw_obsµÄ½á¹û·¢headÇëÇó*/
+/*å¯¹list_bucket_hw_obsçš„ç»“æœå‘headè¯·æ±‚*/
 static int readdir_multi_head_hw_obs(
             const char*         path,
             off_t               offset,
@@ -1742,7 +1742,7 @@ static int list_bucket_hw_obs_with_optimization(
 
 
 /* file gateway modify begin */
-/*Ê¹ÓÃÄ¿Â¼µÄinodeNo×÷Îªprefix·¢ËÍlistÇëÇó(Ö»ÇëÇóÒ»Åú)*/
+/*ä½¿ç”¨ç›®å½•çš„inodeNoä½œä¸ºprefixå‘é€listè¯·æ±‚(åªè¯·æ±‚ä¸€æ‰¹)*/
 static int list_bucket_hw_obs(
                 const char*     path,
                 off_t           marker_pos,
@@ -2024,14 +2024,12 @@ static int parse_stat_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, struct st
     if (mtime == 0)
     {
         S3FS_PRN_ERR("path %s, name %s, node not in element.", path, name);
-        return -1;
     }
 
     mode_t mode = parse_mode_from_node(doc, ctx);
     if (mode == 0)
     {
         S3FS_PRN_ERR("path %s, name %s, mode not in element.", path, name);
-        return -1;
     }
 
     off_t size = parse_size_from_node(doc, ctx);
