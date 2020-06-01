@@ -45,35 +45,25 @@ sudo make install
 Examples
 --------
 
-Enter your S3 identity and credential in a file `/path/to/passwd` and set
+Enter your OBS identity and credential in a file `/path/to/passwd` and set
 owner-only permissions:
 
 ```
-echo MYIDENTITY:MYCREDENTIAL > /path/to/passwd
+echo AK:SK > /path/to/passwd
 chmod 600 /path/to/passwd
 ```
 
 Run obsfs with an existing bucket `mybucket` and directory `/path/to/mountpoint`:
 
 ```
-obsfs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd
+obsfs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd -o use_ino
 ```
 
 If you encounter any errors, enable debug output:
 
 ```
-obsfs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd -o dbglevel=info -f -o curldbg
+obsfs mybucket /path/to/mountpoint -o passwd_file=/path/to/passwd -o use_ino -o dbglevel=info -f -o curldbg
 ```
-
-Note: You may also want to create the global credential file first
-
-```
-echo MYIDENTITY:MYCREDENTIAL > /etc/passwd-obsfs
-chmod 600 /etc/passwd-obsfs
-```
-
-Note2: You may also need to make sure `netfs` service is start on boot
-
 
 
 License
