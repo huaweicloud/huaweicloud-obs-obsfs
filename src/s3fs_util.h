@@ -165,6 +165,8 @@ off_t get_size(const char *s);
 off_t get_size(headers_t& meta);
 mode_t get_mode(const char *s);
 mode_t get_mode(headers_t& meta, const char* path = NULL, bool checkdir = false, bool forcedir = false);
+mode_t get_refined_mode_by_file_type(mode_t mode, headers_t& meta, const char* path, bool isS3sync, bool checkdir = false, bool forcedir = false);
+
 uid_t get_uid(const char *s);
 uid_t get_uid(headers_t& meta);
 gid_t get_gid(const char *s);

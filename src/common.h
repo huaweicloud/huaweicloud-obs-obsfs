@@ -145,14 +145,14 @@ enum s3fs_log_mode{
 
 #define S3FS_LOW_LOGPRN_EXIT(fmt, ...) \
        if(LOG_MODE_FOREGROUND == debug_log_mode){ \
-         fprintf(stderr, "s3fs: " fmt "%s\n", __VA_ARGS__); \
+         fprintf(stderr, "obsfs: " fmt "%s\n", __VA_ARGS__); \
        }\
        else if (LOG_MODE_OBSFS == debug_log_mode)\
        {\
           IndexLog( LOG_INDEX_COMM, 0,S3FS_LOG_LEVEL_TO_SYSLOG(S3FS_LOG_CRIT),fmt "%s", __VA_ARGS__); \
        }\
        else{ \
-         fprintf(stderr, "s3fs: " fmt "%s\n", __VA_ARGS__); \
+         fprintf(stderr, "obsfs: " fmt "%s\n", __VA_ARGS__); \
          syslog(S3FS_LOG_LEVEL_TO_SYSLOG(S3FS_LOG_CRIT), "s3fs: " fmt "%s", __VA_ARGS__); \
        }
 
