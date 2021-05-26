@@ -238,6 +238,12 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
         "request_with_inodeno",
         1
     },    
+    //period check ak sk change
+    {
+        HWS_PERIOD_CHECK_AK_SK_CHANGE,
+        "period_check_ak_sk_change",
+        1
+    },    
     //g_listMaxKey
     {
         HWS_LIST_MAX_KEY,

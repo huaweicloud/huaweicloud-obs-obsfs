@@ -35,6 +35,7 @@
 #include <grp.h>
 #include <getopt.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #include <fstream>
 #include <vector>
@@ -84,7 +85,7 @@ enum dirtype {
 #define INVALID_INODE_NO (-1)
 #define INVALIDE_VALUE   (-1)
 #define HWS_RETRY_WRITE_OBS_NUM  8   /*max retry write osc num*/
-#define READ_PASSWD_CONFIGURE_INTERVAL 3000 /*ms*/
+#define READ_PASSWD_CONFIGURE_INTERVAL 30000 /*ms*/
 #define PASSWD_CHANGE_FILENAME_MAX_LEN 256
 #define PRINT_LENGTH 8              /*print start and end 8 length content when write*/
 //static bool IS_REPLACEDIR(dirtype type) { return DIRTYPE_OLD == type || DIRTYPE_FOLDER == type || DIRTYPE_NOOBJ == type; }
@@ -121,7 +122,7 @@ bool pathrequeststyle             = false;
 bool complement_stat              = false;
 std::string program_name;
 std::string service_path          = "/";
-std::string host                  = "https://s3.amazonaws.com";
+std::string host                  = "";
 std::string bucket                = "";
 std::string writeparmname         = "modify=1&position=";
 std::string endpoint              = "us-east-1";
@@ -184,6 +185,8 @@ static time_t mp_mtime            = 0;
 static off_t mp_st_size           = 0;
 static std::string mountpoint;
 static std::string passwd_file    = "";
+/*add success_file_dir for CCE check mount is OK*/
+static std::string success_file_dir    = "";
 static bool utility_mode          = false;
 static bool noxmlns               = false;
 static bool nocopyapi             = false;
@@ -298,7 +301,7 @@ static std::string build_xattrs(const xattrs_t& xattrs);
 static int s3fs_utility_mode(void);
 static int s3fs_check_service(void);
 static int parse_passwd_file(bucketkvmap_t& resmap);
-static int update_aksk(void);
+static void update_aksk(void);
 static int check_for_aws_format(const kvmap_t& kvmap);
 static int check_passwd_file_perms(void);
 static int read_passwd_file(void);
@@ -919,7 +922,7 @@ static int do_create_bucket(void)
   }else{
     if(NULL == (ptmpfp = tmpfile()) ||
        -1 == (tmpfd = fileno(ptmpfp)) ||
-       0 >= fprintf(ptmpfp, "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n"
+       0 >= fprintf(ptmpfp, "<CreateBucketConfiguration >\n"
         "  <LocationConstraint>%s</LocationConstraint>\n"
         "</CreateBucketConfiguration>", endpoint.c_str()) ||
        0 != fflush(ptmpfp) ||
@@ -1934,18 +1937,19 @@ static int parse_obj_name_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, const
 
     return 0;
 }
-static mode_t parse_mode_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
+static mode_t parse_mode_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* path)
 {
-    headers_t::const_iterator iter;
-
+    mode_t mode = 0;
+	
     string mode_val = "";
     parse_one_value_from_node(doc, hws_list_key_mode, ctx, mode_val);
-    if (mode_val.empty())
+    if (!mode_val.empty())
     {
-        return 0;
+        mode = get_mode(mode_val.c_str());
     }
 
-    return get_mode(mode_val.c_str());
+    headers_t header;
+    return get_refined_mode_by_file_type(mode, header, path, false, true, false);
 }
 
 static long parse_ino_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx)
@@ -2023,13 +2027,13 @@ static int parse_stat_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, struct st
     time_t mtime = parse_mtime_from_node(doc, ctx);
     if (mtime == 0)
     {
-        S3FS_PRN_ERR("path %s, name %s, node not in element.", path, name);
+        S3FS_PRN_WARN("path %s, name %s, node not in element.", path, name);
     }
 
-    mode_t mode = parse_mode_from_node(doc, ctx);
+    mode_t mode = parse_mode_from_node(doc, ctx, path);
     if (mode == 0)
     {
-        S3FS_PRN_ERR("path %s, name %s, mode not in element.", path, name);
+        S3FS_PRN_WARN("path %s, name %s, mode not in element.", path, name);
     }
 
     off_t size = parse_size_from_node(doc, ctx);
@@ -2917,6 +2921,43 @@ static void s3fs_exit_fuseloop(int exit_status) {
     }
 }
 
+/*add success_file_dir for CCE check mount is OK*/
+static int obsfs_write_successfile()
+{
+    char    process_id_str[256]           = {0};
+    std::string success_file_name;
+    int len = 0;
+    int ret_code = 0;
+
+    if (success_file_dir.size() <= 0){
+       return 0;
+    }
+
+    uint64_t process_id = (long long )getpid();
+    snprintf(process_id_str, sizeof(process_id_str), "%ld", process_id); 
+    success_file_name = success_file_dir + "/" + process_id_str;
+
+    umask(S_IXOTH);
+    int success_file = open((const char*)(success_file_name.c_str()), O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+    if (-1 == success_file){
+        S3FS_PRN_ERR("create success_file failed,file_name:%s.", success_file_name.c_str());
+        return -1;
+    }
+
+    len = write(success_file, mountpoint.c_str(), mountpoint.length());
+    if (len <= 0)
+    {
+    	  S3FS_PRN_ERR("write success_file failed,file_name:%s.", success_file_name.c_str());
+        ret_code = -1;
+    }
+    
+    (void)fsync(success_file);
+    close(success_file);
+    S3FS_PRN_INFO("write success_file suceess,file_name:%s,mountpoint:%s.", success_file_name.c_str(), mountpoint.c_str());
+
+    return ret_code;
+}
+
 static void* s3fs_init(struct fuse_conn_info* conn)
 {
   S3FS_PRN_INIT_INFO("init v%s(commit:%s) with %s", VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name());
@@ -2954,8 +2995,6 @@ static void* s3fs_init(struct fuse_conn_info* conn)
 
   // check loading IAM role name
   if(load_iamrole){
-    // load IAM role name from http://169.254.169.254/latest/meta-data/iam/security-credentials
-    //
     S3fsCurl s3fscurl;
     if(!s3fscurl.LoadIAMRoleFromMetaData()){
       S3FS_PRN_CRIT("could not load IAM role name from meta data.");
@@ -2992,6 +3031,12 @@ static void* s3fs_init(struct fuse_conn_info* conn)
   g_thread_daemon_ = std::thread(hws_daemon_task);
   g_thread_deamon_start = true;
 
+  if (0 != obsfs_write_successfile()) {
+      S3FS_PRN_CRIT("could not create successfile.");
+      s3fs_exit_fuseloop(EXIT_FAILURE);
+      return NULL;
+  }
+  
   return NULL;
 }
 
@@ -3346,14 +3391,6 @@ static int s3fs_check_service(void)
       if(check_region_error(body->str(), expectregion)){
         // not specified endpoint, so try to connect to expected region.
         S3FS_PRN_CRIT("Could not connect wrong region %s, so retry to connect region %s.", endpoint.c_str(), expectregion.c_str());
-        endpoint = expectregion;
-        if(S3fsCurl::IsSignatureV4()){
-            if(host == "http://s3.amazonaws.com"){
-                host = "http://s3-" + endpoint + ".amazonaws.com";
-            }else if(host == "https://s3.amazonaws.com"){
-                host = "https://s3-" + endpoint + ".amazonaws.com";
-            }
-        }
 
         // retry to check with new endpoint
         s3fscurl.DestroyCurlHandle();
@@ -3485,34 +3522,53 @@ static int parse_passwd_file(bucketkvmap_t& resmap)
   resmap[string(keyval_fields_type)] = kv;
 
   // read ':' type
+  // The open-source s3fs format (bucket:accesskey:secretkey) is not supported.
   for(iter = linelist.begin(); iter != linelist.end(); ++iter){
-    first_pos = iter->find_first_of(":");
-    last_pos  = iter->find_last_of(":");
-    if(first_pos == string::npos){
-      continue;
-    }
+    int count_colon = std::count(iter->begin(),iter->end(),':');
     string bucket;
     string accesskey;
-    string secret;
-    if(first_pos != last_pos){
-      // formatted by "bucket:accesskey:secretkey"
-      bucket    = trim(iter->substr(0, first_pos));
-      accesskey = trim(iter->substr(first_pos + 1, last_pos - first_pos - 1));
-      secret    = trim(iter->substr(last_pos + 1, string::npos));
-    }else{
-      // formatted by "accesskey:secretkey"
-      bucket    = allbucket_fields_type;
-      accesskey = trim(iter->substr(0, first_pos));
-      secret    = trim(iter->substr(first_pos + 1, string::npos));
+    string secretkey;
+    string token;
+    first_pos = iter->find_first_of(":");
+    last_pos  = iter->find_last_of(":");
+    switch (count_colon) {
+      case 1:
+        // formatted by "accesskey:secretkey"
+        bucket    = allbucket_fields_type;
+        accesskey = trim(iter->substr(0, first_pos));
+        secretkey = trim(iter->substr(first_pos + 1, string::npos));
+        break;
+      case 2:
+        // formatted by "accesskey:secretkey:token"
+        bucket    = allbucket_fields_type;
+        accesskey = trim(iter->substr(0, first_pos));
+        secretkey = trim(iter->substr(first_pos + 1, last_pos - first_pos - 1));
+        token     = trim(iter->substr(last_pos + 1, string::npos));
+
+        if(token.empty()){
+          S3FS_PRN_EXIT("Invalid passwd format: missing content.(Token) AK: %s, SK: %s",
+                        accesskey.c_str(), secretkey.c_str());
+          return -1;
+        }
+        break;
+      default:
+        S3FS_PRN_EXIT("Invalid passwd format: contains too many or too few colons.");
+        return -1;
     }
+    if(accesskey.empty() || secretkey.empty()){
+      S3FS_PRN_EXIT("Invalid passwd format: missing content.(AK or SK)");
+      return -1;
+    }
+
     if(resmap.end() != resmap.find(bucket)){
       S3FS_PRN_EXIT("same bucket(%s) passwd setting found in passwd file.", ("" == bucket ? "default" : bucket.c_str()));
       return -1;
     }
     kv.clear();
     kv[string(aws_accesskeyid)] = accesskey;
-    kv[string(aws_secretkey)]   = secret;
+    kv[string(aws_secretkey)]   = secretkey;
     resmap[bucket]              = kv;
+    S3FS_PRN_INFO("new AKSK in passwd file, AK: %s, SK: %s", accesskey.c_str(), secretkey.c_str())
   }
   return (resmap.empty() ? 0 : 1);
 }
@@ -3604,17 +3660,19 @@ static int check_passwd_file_perms(void)
 //
 // the task updata the new ak/sk in a thread
 //
-static int update_aksk(void)
+static void update_aksk(void)
 {
     string strAKOld = "";
     string strSKOld = "";
 
+	if (0 == HwsGetIntConfigValue(HWS_PERIOD_CHECK_AK_SK_CHANGE)) {
+		//check ak sk change switch close
+		return;
+	}
+
     if(EXIT_SUCCESS != read_passwd_file()){
         S3FS_PRN_INFO("failed to Get access key/secret key from passwd file.");
-        return EXIT_FAILURE;
     }
-
-    return EXIT_SUCCESS;
 }
 //
 // compare the new ak/sk and the old
@@ -3633,8 +3691,8 @@ static bool is_aksk_same(const string strAccessKey, const string strSecretKey)
         return false;
     }
 
-    S3FS_PRN_DBG("success to Get access key = %s,secret key  = %s .from passwd curl.", strAKOld.data(), strSKOld.data());
     if(strAKOld != strAccessKey || strSKOld != strSecretKey){
+		S3FS_PRN_WARN("ak or sk change");
         return false;
     }
     else{
@@ -3642,35 +3700,6 @@ static bool is_aksk_same(const string strAccessKey, const string strSecretKey)
     }
 }
 
-static bool write_passwd_change_file(const string strAccessKey, const string strSecretKey)
-{
-    string   databuf = strAccessKey + ":" + strSecretKey;
-    uint64_t pid     = (long long)getpid();
-
-    char     process_id_str[PASSWD_CHANGE_FILENAME_MAX_LEN] = {0};
-    snprintf(process_id_str, sizeof(process_id_str), "%ld", pid);
-
-    string   passwd_change_file = passwd_file + process_id_str + ".changlog";
-
-    int fhandle = open((const char*)(passwd_change_file.c_str()), O_RDWR | O_TRUNC| O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
-    if (fhandle < 0)
-    {
-        S3FS_PRN_WARN("open file %s failed !", passwd_change_file.c_str())
-        return false;
-    }
-
-    int len = write(fhandle, databuf.c_str(), databuf.length());
-    if (len < 0)
-    {
-        S3FS_PRN_WARN("write file %s failed, actual write %d, expected %lu", passwd_change_file.c_str(), len, databuf.length());
-        close(fhandle);
-        return false;
-    }
-
-    S3FS_PRN_INFO("write file %s success", passwd_change_file.c_str());
-    close(fhandle);
-    return true;
-}
 //
 // read_passwd_file
 //
@@ -3743,11 +3772,8 @@ static int read_passwd_file(void)
         S3FS_PRN_WARN("failed to set internal data for access key/secret key from passwd file.");
         return EXIT_FAILURE;
     }
-    if(!write_passwd_change_file(keyval.at(string(aws_accesskeyid)).c_str(), keyval.at(string(aws_secretkey)).c_str()))
-    {
-       S3FS_PRN_WARN("faild to write passwd changelog file");
-       return EXIT_FAILURE;
-    }
+    S3FS_PRN_WARN("AKSK is updated successfully. AK:%s SK:%s", keyval.at(string(aws_accesskeyid)).c_str(),
+                  keyval.at(string(aws_secretkey)).c_str());
   }
 
   return EXIT_SUCCESS;
@@ -4174,6 +4200,12 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       passwd_file = strchr(arg, '=') + sizeof(char);
       return 0;
     }
+    /*add success_file_dir for CCE check mount is OK*/
+    if(0 == STR2NCMP(arg, "success_file_dir=")){
+      success_file_dir = strchr(arg, '=') + sizeof(char);
+      return 0;
+    }
+    
     if(0 == strcmp(arg, "ibm_iam_auth")){
       S3fsCurl::SetIsIBMIAMAuth(true);
       S3fsCurl::SetIAMCredentialsURL("https://iam.bluemix.net/oidc/token");
@@ -4189,7 +4221,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         return -1;
       }
       S3fsCurl::SetIsECS(true);
-      S3fsCurl::SetIAMCredentialsURL("http://169.254.170.2");
+      S3fsCurl::SetIAMCredentialsURL("");
       S3fsCurl::SetIAMFieldCount(5);
       is_ecs = true;
       return 0;
@@ -5053,7 +5085,12 @@ static int s3fs_getattr_hw_obs(const char* path, struct stat* pstbuf)
         s3fsStatisEnd(GETATTR_DELAY, &begin_tv);
         return result;
     }
-
+	//set dir size to blksize
+    if (S_ISDIR(pstbuf->st_mode))
+    {
+        pstbuf->st_size = pstbuf->st_blksize;
+    }
+	
     s3fsStatisEnd(GETATTR_DELAY, &begin_tv);
     timeval      end_tv;
     gettimeofday(&end_tv, NULL);

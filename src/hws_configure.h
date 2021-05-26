@@ -82,6 +82,8 @@ typedef enum
     //3. other paras
     //head req with inodeno,default true
     HWS_REQUEST_WITH_INODENO,
+    //period check ak sk change
+    HWS_PERIOD_CHECK_AK_SK_CHANGE,
     //g_listMaxKey, default 110
     HWS_LIST_MAX_KEY,
 

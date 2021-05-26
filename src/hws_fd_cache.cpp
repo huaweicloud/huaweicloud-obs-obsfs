@@ -965,8 +965,15 @@ int HwsFdWritePageList::ReadLastOverLap(const char* path,
 bool HwsFdWritePageList::IsFull()
 {
     unsigned int max_page_num = HwsFdManager::GetInstance().GetWritePageNumByCacheSize();
-    
-    return pages_.size() >= max_page_num && pages_.back()->state_ > HWS_FD_WRITE_STATE_WAIT;
+
+    if (0 == max_page_num) 
+    {
+        return true;
+    }
+    else 
+    {    
+        return pages_.size() >= max_page_num && pages_.back()->state_ > HWS_FD_WRITE_STATE_WAIT;
+    }
 }
 /*get page list size,
   must lock write_merge_mutex_ in caller*/
