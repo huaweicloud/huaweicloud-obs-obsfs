@@ -22,8 +22,7 @@ function log()
 # install obsfs
 function install_obsfs()
 {
-    chmod 700 obsfs
-    cp obsfs /usr/local/bin/  &&  cp version.txt /etc/obsfsversion
+    cp ${current_path}/src/obsfs /usr/local/bin/  &&  cp ${current_path}/version.txt /etc/obsfsversion
     if [ $? -ne 0 ];then
         log "Install obsfs failed."
         exit 1
@@ -40,7 +39,7 @@ function install_log_rotate()
     if [ ! -d ${log_rotate_shell_path} ]; then
         mkdir -p ${log_rotate_shell_path}
     fi
-    cp -r ${current_path}/obsfs_log_rotate.sh ${log_rotate_shell_path}/
+    cp -r ${current_path}/build/obsfs_log_rotate.sh ${log_rotate_shell_path}/
     if [ $? -ne 0 ];then
         log "Install obsfs_log_rotate.sh failed."
         exit 1
