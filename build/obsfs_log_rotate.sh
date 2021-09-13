@@ -9,6 +9,7 @@ ONE_MB=`expr $ONE_KB \* 1024`
 ONE_GB=`expr $ONE_MB \* 1024`
 LOG_MAX_SIZE=`expr $ONE_MB \* 512`
 OBSFS_LOG_PATH="/var/log/obsfs"
+mkdir -p ${OBSFS_LOG_PATH}
 MAX_LOG_DIR_SIZE=$(df ${OBSFS_LOG_PATH} | awk '{print $2}' | tail -n 1)
 MAX_LOG_DIR_SIZE=`expr ${MAX_LOG_DIR_SIZE} \* 4 / 5`
 TIME_BASE_STR=`date -d -360day +%Y-%m-%d`
