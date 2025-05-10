@@ -1,3 +1,16 @@
+/*
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
 #include "hws_index_cache.h"
 
 
@@ -42,20 +55,30 @@ void IndexCache::operateOpenCnt(Node* node, tag_open_cnt_use_type openCntType)
     return;
 }
 
+Node* IndexCache::getnodeInlock(string &key)
+{
+    auto it = hashmap_.find(key);
+    if (it != hashmap_.end()) {
+        return it->second;
+    }
+
+    return NULL;
+}
+
 void IndexCache::putNodeToList(Node* node, string key)
 {
     if ( 0 < node->openCnt)
     {
         SNAS_ListAdd(&node->list_ptr, &openflag_head);
-        S3FS_PRN_DBG("[node=%p][path=%s][dentryname=%s][inodeNo=%lld][firstWritFlag=%d][fsversionId=%s][plogHeadversion=%s][openCnt=%d],"\
-            "in openflag list", node, key.c_str(), node->data.dentryname.c_str(), node->data.inodeNo, node->data.firstWritFlag,
+        S3FS_PRN_DBG("[path=%s][dentryname=%s][inodeNo=%lld][firstWritFlag=%d][fsversionId=%s][plogHeadversion=%s][openCnt=%d],"\
+            "in openflag list", key.c_str(), node->data.dentryname.c_str(), node->data.inodeNo, node->data.firstWritFlag,
             node->data.fsVersionId.c_str(), node->data.plogheadVersion.c_str(), node->openCnt);
     }
     else if (0 == node->openCnt)
     {
         SNAS_ListAdd(&node->list_ptr, &lru_head);
-        S3FS_PRN_DBG("[node=%p][path=%s][dentryname=%s][inodeNo=%lld][firstWritFlag=%d][fsversionId=%s][plogHeadversion=%s][openCnt=%d],"\
-            "in lru list", node, key.c_str(), node->data.dentryname.c_str(), node->data.inodeNo, node->data.firstWritFlag,
+        S3FS_PRN_DBG("[path=%s][dentryname=%s][inodeNo=%lld][firstWritFlag=%d][fsversionId=%s][plogHeadversion=%s][openCnt=%d],"\
+            "in lru list", key.c_str(), node->data.dentryname.c_str(), node->data.inodeNo, node->data.firstWritFlag,
             node->data.fsVersionId.c_str(), node->data.plogheadVersion.c_str(), node->openCnt);
     }
     else
@@ -63,31 +86,31 @@ void IndexCache::putNodeToList(Node* node, string key)
 
         hashmap_.erase(key);
         SNAS_ListAdd(&node->list_ptr, &lru_head);
-        S3FS_PRN_ERR("[node=%p][path=%s][dentryname=%s][inodeNo=%lld][firstWritFlag=%d][fsversionId=%s][plogHeadversion=%s],"\
-            "openCnt[%d], inner error", node, key.c_str(), node->data.dentryname.c_str(), node->data.inodeNo, node->data.firstWritFlag,
+        S3FS_PRN_ERR("[path=%s][dentryname=%s][inodeNo=%lld][firstWritFlag=%d][fsversionId=%s][plogHeadversion=%s],"\
+            "openCnt[%d], inner error", key.c_str(), node->data.dentryname.c_str(), node->data.inodeNo, node->data.firstWritFlag,
             node->data.fsVersionId.c_str(), node->data.plogheadVersion.c_str(), node->openCnt);
     }
 }
 
 int IndexCache::setFirstWriteFlag(string key)
 {
-    pthread_spin_lock(&(index_cache_lock));
-    Node *node = hashmap_[key];
+    std::lock_guard<std::mutex> lock(index_cache_mutex);
+    Node *node = getnodeInlock(key);
 
     if(node)
     {
         /*firstWritFlag must set be false*/
         node->data.firstWritFlag= false;
     }
-    pthread_spin_unlock(&(index_cache_lock));
 
     return 0;
 }
+
 int IndexCache::setFilesizeOrClearGetAttrStat(string path,
-        off64_t cacheFileSize,bool clearGetAttrStat)
+        off64_t cacheFileSize, bool clearGetAttrStat, CACHE_STAT_TYPE statType)
 {
-    pthread_spin_lock(&(index_cache_lock));
-    Node *node = hashmap_[path];
+    index_cache_mutex.lock();
+    Node *node = getnodeInlock(path);
     off64_t tempFileSize = -1;
 
     if(node)
@@ -98,31 +121,58 @@ int IndexCache::setFilesizeOrClearGetAttrStat(string path,
             tempFileSize = node->data.stGetAttrStat.st_size;
         }
         node->data.stGetAttrStat.st_mtime = time((time_t *)NULL);
+        if (statType < STAT_TYPE_BUTT){
+            node->data.statType = statType;
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &(node->data.getAttrCacheSetTs));
+        }
         //clear getAttrCacheSetTs so stGetAttrStat is invalid
         if (clearGetAttrStat)
         {
-            memset(&(node->data.stGetAttrStat), 0, sizeof(struct stat));    
-            memset(&(node->data.getAttrCacheSetTs), 0, sizeof(struct timespec));    
+            memset(&(node->data.stGetAttrStat), 0, sizeof(struct stat));
+            memset(&(node->data.getAttrCacheSetTs), 0, sizeof(struct timespec));
         }
     }
-    pthread_spin_unlock(&(index_cache_lock));
+    index_cache_mutex.unlock();
 
     S3FS_PRN_INFO("set statCache,tempFileSize=%ld,cacheFileSize=%ld,path=%s,clearGetAttrMs=%d", 
         tempFileSize,cacheFileSize,path.c_str(),clearGetAttrStat);
 
     return 0;
 }
+
+int IndexCache::setFilesizeAndClearIndexCacheTime(string path, off64_t cacheFileSize)
+{
+    index_cache_mutex.lock();
+    Node *node = getnodeInlock(path);
+    off64_t tempFileSize = -1;
+
+    if(node)
+    {
+        node->data.stGetAttrStat.st_size = cacheFileSize;
+        tempFileSize = node->data.stGetAttrStat.st_size;
+        node->data.stGetAttrStat.st_mtime = time((time_t *) NULL);
+        //clear getAttrCacheSetTs so stGetAttrStat is invalid
+        memset(&(node->data.getAttrCacheSetTs), 0, sizeof(struct timespec));
+    }
+    index_cache_mutex.unlock();
+
+    S3FS_PRN_INFO("set statCache,tempFileSize=%ld,cacheFileSize=%ld,path=%s",
+                  tempFileSize, cacheFileSize, path.c_str());
+
+    return 0;
+}
+
 void IndexCache::AddEntryOpenCnt(string path)
 {
-    pthread_spin_lock(&(index_cache_lock));
-    Node *node = hashmap_[path];
+    std::lock_guard<std::mutex> lock(index_cache_mutex);
+    Node *node = getnodeInlock(path);
 
     if(node)
     {
         operateOpenCnt(node, ADD_OPEN_CNT);
     }
-    pthread_spin_unlock(&(index_cache_lock));
 }
+
 Node* IndexCache::getFreeNodeAndEraseMap(const char* pathStr)
 {
     SNAS_ListHead* pListHead = NULL;
@@ -150,16 +200,16 @@ Node* IndexCache::getFreeNodeAndEraseMap(const char* pathStr)
     SNAS_ListDel(taillistnode);
     Node* node = container_of(taillistnode, Node, list_ptr);
 
-    Node* nodeInMap = hashmap_[node->data.key];
+    Node* nodeInMap = getnodeInlock(node->data.key);
 
     if (nodeInMap && nodeInMap == node)
     {
-    	S3FS_PRN_INFO("erase node[%p],  key[%s], openCnt[%d]",
-            node, node->data.key.c_str(), node->openCnt);
+    	S3FS_PRN_INFO("erase node,  key[%s], openCnt[%d]",
+            node->data.key.c_str(), node->openCnt);
             hashmap_.erase(node->data.key);
     }
-    S3FS_PRN_DBG("free node[%p], key[%s], openCnt[%d]",
-        node, node->data.key.c_str(), node->openCnt);
+    S3FS_PRN_DBG("free node, key[%s], openCnt[%d]",
+        node->data.key.c_str(), node->openCnt);
     node->openCnt = 0;
 
     return node;
@@ -167,8 +217,8 @@ Node* IndexCache::getFreeNodeAndEraseMap(const char* pathStr)
 
 int IndexCache::putIndexInternal(string key,tag_index_cache_entry_t * data,tag_open_cnt_use_type openCntType)
 {
-    pthread_spin_lock(&(index_cache_lock));
-    Node *node = hashmap_[key];
+    index_cache_mutex.lock();
+    Node *node = getnodeInlock(key);
 
     if(node)
     { // node exists
@@ -199,9 +249,9 @@ int IndexCache::putIndexInternal(string key,tag_index_cache_entry_t * data,tag_o
         
         operateOpenCnt(node, openCntType);
         putNodeToList(node, key);
-        pthread_spin_unlock(&(index_cache_lock));
-        S3FS_PRN_DBG("put index cache and exist, node[%p], node->list_head[%p], inode[%lld], dentryName[%s], key[%s], datakey[%s], openCnt[%d]",
-        node, &node->list_ptr, node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->data.key.c_str(), node->openCnt);
+        index_cache_mutex.unlock();
+        S3FS_PRN_DBG("put index cache and exist, inode[%lld], dentryName[%s], key[%s], datakey[%s], openCnt[%d]",
+        node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->data.key.c_str(), node->openCnt);
     }
     else
     {
@@ -209,7 +259,7 @@ int IndexCache::putIndexInternal(string key,tag_index_cache_entry_t * data,tag_o
         node = getFreeNodeAndEraseMap(key.c_str());
         if(NULL == node)
         {
-            pthread_spin_unlock(&(index_cache_lock));
+            index_cache_mutex.unlock();
             S3FS_PRN_WARN("put index cache and not exist and lru_list is empty, then failed, inode[%lld], dentryName[%s], key[%s]",
                 data->inodeNo, data->dentryname.c_str(), key.c_str());
             return -1;
@@ -222,9 +272,9 @@ int IndexCache::putIndexInternal(string key,tag_index_cache_entry_t * data,tag_o
         hashmap_[key] = node;
         putNodeToList(node, key);
 
-        pthread_spin_unlock(&(index_cache_lock));
-        S3FS_PRN_INFO("put index cache and not exist, insert and move to head, node[%p], list_head[%p], inode[%lld], dentryName[%s], key[%s], datakey[%s], openCnt[%d]",
-            node, &node->list_ptr, node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->data.key.c_str(), node->openCnt);
+        index_cache_mutex.unlock();
+        S3FS_PRN_INFO("put index cache and not exist, insert and move to head, inode[%lld], dentryName[%s], key[%s], datakey[%s], openCnt[%d]",
+            node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->data.key.c_str(), node->openCnt);
     }
     return 0;
 }
@@ -260,31 +310,29 @@ int IndexCache::PutIndexAddOpenCnt(string key, tag_index_cache_entry_t *data)
 int IndexCache::PutIndexReduceOpenCnt(string key)
 {
     S3FS_PRN_DBG("start release file[%s] handle in index cache", key.c_str());
-    pthread_spin_lock(&(index_cache_lock));
-    Node *node = hashmap_[key];
+    std::lock_guard<std::mutex> lock(index_cache_mutex);
+    Node *node = getnodeInlock(key);
 
     if(node)
     { // node exists
         SNAS_ListDel(&node->list_ptr);
-        S3FS_PRN_DBG("release the file in cache, node[%p], node->list_head[%p], inode[%lld], dentryName[%s], key[%s], openCnt[%d]",
-                        node, &node->list_ptr, node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->openCnt);
+        S3FS_PRN_DBG("release the file in cache, inode[%lld], dentryName[%s], key[%s], openCnt[%d]",
+                        node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->openCnt);
         operateOpenCnt(node, REDUCE_OPEN_CNT);
         putNodeToList(node, key);
-        pthread_spin_unlock(&(index_cache_lock));
         return 0;
     }
     else
     {
         S3FS_PRN_ERR("file[%s] not exist ", key.c_str());
-        pthread_spin_unlock(&(index_cache_lock));
         return -1;
     }
 }
 //find cache entry by key and copy entry to output data
 bool IndexCache::GetIndex(string key, tag_index_cache_entry_t* data)
 {
-    pthread_spin_lock(&(index_cache_lock));
-    Node *node = hashmap_[key];
+    index_cache_mutex.lock();
+    Node *node = getnodeInlock(key);
     if(node)
     {
         // check name in dentryname is same as name in key
@@ -293,9 +341,9 @@ bool IndexCache::GetIndex(string key, tag_index_cache_entry_t* data)
         std::string name_in_key = key.substr(key.find_last_of("/") + 1);
         if(name_in_node.compare(name_in_key) != 0 || key.compare(node->data.key) != 0)
         {
-            S3FS_PRN_ERR("cache inconsistent: node(%p), list_head(%p), dentryName(%s), inode(%lld), key(%s), keyInNode(%s)",
-                         node, &node->list_ptr, dentryname.c_str(), node->data.inodeNo, key.c_str(), node->data.key.c_str());
-            pthread_spin_unlock(&(index_cache_lock));
+            S3FS_PRN_ERR("cache inconsistent: dentryName(%s), inode(%lld), key(%s), keyInNode(%s)",
+                         dentryname.c_str(), node->data.inodeNo, key.c_str(), node->data.key.c_str());
+            index_cache_mutex.unlock();
 
             if (cache_assert)
             {
@@ -309,7 +357,7 @@ bool IndexCache::GetIndex(string key, tag_index_cache_entry_t* data)
         putNodeToList(node, key);
         *data = node->data;
 
-        pthread_spin_unlock(&(index_cache_lock));
+        index_cache_mutex.unlock();
 
         /* check fuse path and shardkey from indexcache */
         const char* key_c_str = key.c_str();
@@ -317,13 +365,11 @@ bool IndexCache::GetIndex(string key, tag_index_cache_entry_t* data)
 
         S3FS_PRN_DBG("get index cache dentryname(%s) with key(%s), openCnt[%d]",
             data->dentryname.c_str(), key_c_str, node->openCnt);
-
-        S3FS_PRN_DBG("get index cache and exist, then return true");
         return true;
     }
     else
     {// not exist
-        pthread_spin_unlock(&(index_cache_lock));
+        index_cache_mutex.unlock();
         S3FS_PRN_DBG("get index cache and not exist, then return false");
         return false;
     }
@@ -333,9 +379,9 @@ void IndexCache::DeleteIndex(string key)
 {
     S3FS_PRN_DBG("start delete index cache path = %s",key.c_str());
 
-    pthread_spin_lock(&(index_cache_lock));
+    index_cache_mutex.lock();
 
-    Node *node = hashmap_[key];
+    Node *node = getnodeInlock(key);
     if(node)
     {
         // node exists
@@ -344,15 +390,15 @@ void IndexCache::DeleteIndex(string key)
         SNAS_ListAddTail(&node->list_ptr, &lru_head);
 
         hashmap_.erase(key);
-        pthread_spin_unlock(&(index_cache_lock));
-	S3FS_PRN_INFO("delete index cache and exist, node[%p], node->list_head[%p], inode[%lld], dentryName[%s], key[%s], openCnt[%d]",
-            node, &node->list_ptr, node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->openCnt);
+        index_cache_mutex.unlock();
+	    S3FS_PRN_INFO("delete index cache and exist, inode[%lld], dentryName[%s], key[%s], openCnt[%d]",
+            node->data.inodeNo, node->data.dentryname.c_str(), key.c_str(), node->openCnt);
 
     }
     else
     {
         //not existed
-        pthread_spin_unlock(&(index_cache_lock));
+        index_cache_mutex.unlock();
         S3FS_PRN_DBG("delete index cache but not exist, key[%s]", key.c_str());
     }
 }
@@ -360,11 +406,10 @@ void IndexCache::DeleteIndex(string key)
 /* only for rename now */
 void IndexCache::ReplaceIndex(string srcKey, string destKey, tag_index_cache_entry_t* p_index_cache_entry)
 {
+    index_cache_mutex.lock();
 
-    pthread_spin_lock(&(index_cache_lock));
-
-    Node *srcNode = hashmap_[srcKey];
-    Node *destNode = hashmap_[destKey];
+    Node *srcNode = getnodeInlock(srcKey);
+    Node *destNode = getnodeInlock(destKey);
     if(srcNode)
     {
         // srcNode exists
@@ -419,14 +464,19 @@ void IndexCache::ReplaceIndex(string srcKey, string destKey, tag_index_cache_ent
 
         hashmap_.erase(srcKey);
 
-        pthread_spin_unlock(&(index_cache_lock));
-	S3FS_PRN_INFO("replace index cache from path = %s to %s, openCnt[%d]",srcKey.c_str(), destKey.c_str(), destNode->openCnt);
+        index_cache_mutex.unlock();
+        if (destNode) {
+            S3FS_PRN_INFO("replace index cache from path = %s to %s, openCnt[%d]",
+                          srcKey.c_str(), destKey.c_str(), destNode->openCnt);
+        }else{
+            S3FS_PRN_INFO("replace index cache from path = %s to %s fail", srcKey.c_str(), destKey.c_str());
+        }
 
     }
     else
     {
         //not existed
-        pthread_spin_unlock(&(index_cache_lock));
+        index_cache_mutex.unlock();
         S3FS_PRN_DBG("replace index cache path %s, but not exist", srcKey.c_str());
     }
 }
@@ -442,12 +492,12 @@ void IndexCache::resizeMetaCacheCapacity(size_t capacity)
 
     Node* extendEntries = new Node[extendNum];
 
-    pthread_spin_lock(&(index_cache_lock));
+    index_cache_mutex.lock();
     for(size_t i=0; i<extendNum; ++i)
     {
         SNAS_ListAdd(&(extendEntries+i)->list_ptr, &lru_head);
     }
     gMetaCacheSize = capacity;
-    pthread_spin_unlock(&(index_cache_lock));
+    index_cache_mutex.unlock();
 }
 

@@ -1,21 +1,14 @@
 /*
- * s3fs - FUSE-based file system backed by Amazon S3
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
  *
- * Copyright(C) 2007 Randy Rizun <rrizun@gmail.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
  *
  * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
 #include <stdio.h>
@@ -36,6 +29,7 @@
 #include <getopt.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <iostream>
 
 #include <fstream>
 #include <vector>
@@ -61,6 +55,8 @@
 #include "obsfs_log.h"
 
 #include "readdir_marker_map.h"
+#include "hws_fs_util.h"
+#include "hws_cipher_key_check.h"
 
 #ifdef S3_MOCK
 
@@ -85,15 +81,26 @@ enum dirtype {
 #define INVALID_INODE_NO (-1)
 #define INVALIDE_VALUE   (-1)
 #define HWS_RETRY_WRITE_OBS_NUM  8   /*max retry write osc num*/
-#define READ_PASSWD_CONFIGURE_INTERVAL 30000 /*ms*/
+#define READ_PASSWD_CONFIGURE_INTERVAL 3000 /*ms*/
 #define PASSWD_CHANGE_FILENAME_MAX_LEN 256
 #define PRINT_LENGTH 8              /*print start and end 8 length content when write*/
+#define MAX_PATH_LENGTH 1024
 //static bool IS_REPLACEDIR(dirtype type) { return DIRTYPE_OLD == type || DIRTYPE_FOLDER == type || DIRTYPE_NOOBJ == type; }
 static bool IS_RMTYPEDIR(dirtype type) { return DIRTYPE_OLD == type || DIRTYPE_FOLDER == type; }
 
 #if !defined(ENOATTR)
 #define ENOATTR				ENODATA
 #endif
+#define MAX_RETRY_TIMES 128                  /* max retry times for curl */
+#define MAX_OBS_URL_LENGTH 65535
+#define MAX_OBS_FILEPATH_LENGTH 1024
+#define CONNECT_TIMEOUT 3600
+#define READWRITE_TIMEOUT 3600
+#define MIN_HWCACHE_WRITE_SIZE 1024          /* min write page size, 1k */
+#define MAX_HWCACHE_WRITE_SIZE 134217728     /* max write page size, 128M */
+#define MIN_CACHE_SIZE 128                   /* min data cache total size, 128M */
+#define MAX_CACHE_SIZE 1048576               /* max data cache total size, 1T */
+#define MAX_RESOLVE_RETRY 100                /* max retry times for resolve-host error */
 
 //-------------------------------------------------------------------
 // Structs
@@ -128,7 +135,6 @@ std::string writeparmname         = "modify=1&position=";
 std::string endpoint              = "us-east-1";
 std::string cipher_suites         = "";
 const char* hws_s3fs_client       = "x-hws-fs-client";
-const char* hws_s3fs_req_objname_use_path = "x-hws-fs-req-objname-use-path";
 const char* hws_s3fs_connection   = "Connection";
 const char* hws_s3fs_inodeNo      = "x-hws-fs-inodeno";
 const char* hws_s3fs_shardkey     = "x-hws-fs-inode-dentryname";
@@ -185,6 +191,9 @@ static time_t mp_mtime            = 0;
 static off_t mp_st_size           = 0;
 static std::string mountpoint;
 static std::string passwd_file    = "";
+static std::string accesskey      = "";
+static std::string secretkey      = "";
+static std::string securitytoken  = "";
 /*add success_file_dir for CCE check mount is OK*/
 static std::string success_file_dir    = "";
 static bool utility_mode          = false;
@@ -216,6 +225,7 @@ static const std::string allbucket_fields_type = "";         // special key for 
 static const std::string keyval_fields_type    = "\t";       // special key for mapping(This name is absolutely not used as a bucket name)
 static const std::string aws_accesskeyid       = "AWSAccessKeyId";
 static const std::string aws_secretkey         = "AWSSecretKey";
+static const std::string aws_token             = "AWSToken";
 
 static const std::string obsfs_log_file_path   = "/var/log/obsfs/";
 static const std::string obsfs_log_file_name   = "obsfs_log";
@@ -236,10 +246,10 @@ static int chk_dir_object_type(const char* path, string& newpath, string& nowpat
 static int remove_old_type_dir(const string& path, dirtype type);
 
 static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t* pmeta = NULL, tag_index_cache_entry_t* p_index_cache_entry = NULL, long* headLastResponseCode = NULL);
-static int check_object_access(const char* path, int mask, struct stat* pstbuf, long long* inodeNo = NULL);
-static int check_object_access_with_openflag(const char* path, int mask, struct stat* pstbuf, long long* inodeNo = NULL, bool openflag = false);
+static int check_object_access(const char* path, unsigned int mask, struct stat* pstbuf, long long* inodeNo = NULL);
+static int check_object_access_with_openflag(const char* path, unsigned int mask, struct stat* pstbuf, long long* inodeNo = NULL, bool openflag = false);
 static int check_object_owner(const char* path, struct stat* pstbuf);
-static int check_parent_object_access(const char* path, int mask);
+static int check_parent_object_access(const char* path, unsigned int mask);
 static FdEntity* get_local_fent(const char* path, bool is_load = false);
 #if 0
 static bool multi_head_callback(S3fsCurl* s3fscurl);
@@ -299,7 +309,7 @@ static bool parse_xattr_keyval(const std::string& xattrpair, string& key, PXATTR
 static size_t parse_xattrs(const std::string& strxattrs, xattrs_t& xattrs);
 static std::string build_xattrs(const xattrs_t& xattrs);
 static int s3fs_utility_mode(void);
-static int s3fs_check_service(void);
+static int s3fs_check_service(const std::string& ak = "", const std::string& sk = "", const std::string& token = "");
 static int parse_passwd_file(bucketkvmap_t& resmap);
 static void update_aksk(void);
 static int check_for_aws_format(const kvmap_t& kvmap);
@@ -380,6 +390,7 @@ static int s3fs_open_hw_obs(const char* path, struct fuse_file_info* fi);
 static int s3fs_flush_hw_obs(const char* path, struct fuse_file_info* fi);
 static int s3fs_release_hw_obs(const char* path, struct fuse_file_info* fi);
 static int s3fs_fsync_hw_obs(const char* path, int datasync, struct fuse_file_info* fi);
+static int validate_filepath_length(const char* path);
 /* file gateway modify end */
 
 //-------------------------------------------------------------------
@@ -602,12 +613,12 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
 // mask:   bit field(F_OK, R_OK, W_OK, X_OK) like access().
 // stat:   NULL or the pointer of struct stat.
 //
-static int check_object_access(const char* path, int mask, struct stat* pstbuf, long long* inodeNo)
+static int check_object_access(const char* path, unsigned int mask, struct stat* pstbuf, long long* inodeNo)
 {
     return check_object_access_with_openflag(path, mask, pstbuf, inodeNo, false);
 }
 
-static int check_object_access_with_openflag(const char* path, int mask, struct stat* pstbuf,
+static int check_object_access_with_openflag(const char* path, unsigned int mask, struct stat* pstbuf,
     long long* inodeNo, bool openflag)
 {
   int result;
@@ -728,7 +739,7 @@ static int check_object_owner(const char* path, struct stat* pstbuf)
 //
 // Check accessing the parent directories of the object by uid and gid.
 //
-static int check_parent_object_access(const char* path, int mask)
+static int check_parent_object_access(const char* path, unsigned int mask)
 {
   string parent;
   int result;
@@ -881,7 +892,7 @@ static int s3fs_readlink(const char* path, char* buf, size_t size)
          return -ENOENT;
     }
 
-    size_t readsize = statBuf.st_size;
+    size_t readsize = (size_t)(statBuf.st_size);
     if(size <= readsize + 1)
     {
         S3FS_PRN_ERR("[path=%s] readlink size small,size=%u,filesize=%u",
@@ -1003,6 +1014,12 @@ static int directory_empty(const char* path, long long inodeNo)
 /* modify for object_file_gateway*/
 static int s3fs_symlink(const char* from, const char* to)
 {
+    int validateLengthResult = validate_filepath_length(to);
+    if( validateLengthResult != 0) {
+        S3FS_PRN_ERR("symlink: target path length exceeds maximum, abort [to=%s][result=%d]", to, validateLengthResult);
+        return validateLengthResult;
+    }
+
     int result;
     struct fuse_context* pcxt;
     struct stat buf;
@@ -1050,7 +1067,7 @@ static int s3fs_symlink(const char* from, const char* to)
 
     // write(without space words)
     string  strFrom   = trim(string(from));
-    ssize_t from_size = static_cast<ssize_t>(strFrom.length());
+    size_t from_size = strFrom.length();
 
 
     tagDataBuffer databuff;
@@ -1133,12 +1150,10 @@ static int rename_object(const char* from, const char* to)
 
   S3fsCurl s3fscurl;
   result = s3fscurl.RenameFileOrDirObject(from, to, need_check_to);
-  // rename retry failed, need check [to] whether exist.
-  if (need_check_to){
-      int head_to_result = get_object_attribute_with_open_flag_hw_obs(to, &statBuf, &pmeta, &inodeNoCheck, false);
-      if (0 == head_to_result && inodeNo == inodeNoCheck) {
-          result = 0;
-      }
+
+  int head_to_result = get_object_attribute_with_open_flag_hw_obs(to, &statBuf, &pmeta, &inodeNoCheck, false, NULL, NULL, false);
+  if (0 == head_to_result && inodeNo == inodeNoCheck) {
+      result = 0;
   }
   S3FS_PRN_INFO1("RenameFileOrDirObject end,[from=%s][to=%s] [result=%d]",
       from,to,result);
@@ -1148,12 +1163,12 @@ static int rename_object(const char* from, const char* to)
   int result_head = 0;
   if (0 == result)
   {
-  	bool get_ok = IndexCache::getIndexCache()->GetIndex(to, &to_cache_entry);
+  	get_ok = IndexCache::getIndexCache()->GetIndex(to, &to_cache_entry);
 	if (!get_ok)
 	{
 		//if dest path not exist in cache,send head request to get dentry
-	    struct stat statBuf;
-	    result_head = get_object_attribute(to, &statBuf, NULL, &to_cache_entry);
+	    struct stat statBuffer;
+	    result_head = get_object_attribute(to, &statBuffer, NULL, &to_cache_entry);
 	    if(0 != result_head){
 	      S3FS_PRN_ERR("[to=%s]The rename operation success, but the dest path not found.", to);
 	    }
@@ -1171,6 +1186,12 @@ static int rename_object(const char* from, const char* to)
 
 static int s3fs_rename(const char* from, const char* to)
 {
+  int validateLengthResult = validate_filepath_length(to);
+  if( validateLengthResult != 0) {
+    S3FS_PRN_ERR("rename: target path length exceeds maximum, abort [to=%s][result=%d]", to, validateLengthResult);
+    return validateLengthResult;
+  }
+
   int result;
   timeval begin_tv;
   s3fsStatisStart(RENAME_TOTAL, &begin_tv);
@@ -1599,7 +1620,11 @@ static int s3fs_truncate(const char* path, off_t length)
       ent->UpdateFileSizeForTruncate(length);
   }
   //clear get attr stat after truncate succeed
-  IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(str_path,0,true);
+  //truncate operation clear getAttrCacheSetTs, but not clear stat, and do not judge to be set fileSize.
+  //because in over write operation, if IndexCache is exist, write operation will also update IndexCache.
+  //this conditon will cause stat is empty but st_size and st_mtime.
+  //In only truncate operation, after truncate, OS will invoke stat, file system get stat from server
+  IndexCache::getIndexCache()->setFilesizeAndClearIndexCacheTime(str_path, 0);
 
   s3fsStatisEnd(TRUNCATE_TOTAL, &begin_tv,path);
   return result;
@@ -1692,6 +1717,7 @@ static int list_bucket_hw_obs_with_optimization(
   string    query_max_keys = "";
   string    query_prefix = "";
   string    each_query = "";
+  string    query_encode = "";
   S3fsCurl  s3fscurl;
   xmlDocPtr doc;
   BodyData* body = nullptr;
@@ -1711,10 +1737,15 @@ static int list_bucket_hw_obs_with_optimization(
 
   // max-keys
   query_max_keys = string("max-keys=") + toString(list_max_key) + "&";
+
+  //listresult encode
+  query_encode = string("encoding-type=url") + "&";
+
   // prefix
   query_prefix = "prefix=" + ino_str;
-  // query filter composed of delimiter, marker, maxkey and prefix
-  each_query = query_delimiter + query_marker + query_max_keys + query_prefix;
+
+  // query filter composed of delimiter, marker, maxkey , query_encode and prefix
+  each_query = query_delimiter + query_marker + query_max_keys + query_encode + query_prefix;
 
   // request one batch of path names */
   result = s3fscurl.ListBucketRequest(path, each_query.c_str());
@@ -1761,6 +1792,7 @@ static int list_bucket_hw_obs(
   string    query_marker = "";
   string    query_max_keys = "";
   string    query_prefix = "";
+  string    query_encode = "";
   string    each_query = "";
   S3fsCurl  s3fscurl;
   xmlDocPtr doc;
@@ -1780,10 +1812,15 @@ static int list_bucket_hw_obs(
   }
   // max-keys
   query_max_keys = string("max-keys=") + toString(max_keys) + "&";
+
+  //listresult encode
+  query_encode = string("encoding-type=url") + "&";
+
   // prefix
   query_prefix = "prefix=" + ino_str;
+
   // query filter composed of delimiter, marker, maxkey and prefix
-  each_query = query_delimiter + query_marker + query_max_keys + query_prefix;
+  each_query = query_delimiter + query_marker + query_max_keys + query_encode + query_prefix;
 
   // request one batch of path names */
   result = s3fscurl.ListBucketRequest(path, each_query.c_str());
@@ -1920,6 +1957,7 @@ static int parse_obj_name_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, const
         return -1;
     }
 
+    dentry_name = urlDecodeSpecial(dentry_name);
     char* pure_name = extract_object_name_for_show(path, dentry_name.c_str());
     if (!pure_name)
     {
@@ -1940,7 +1978,7 @@ static int parse_obj_name_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, const
 static mode_t parse_mode_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* path)
 {
     mode_t mode = 0;
-	
+
     string mode_val = "";
     parse_one_value_from_node(doc, hws_list_key_mode, ctx, mode_val);
     if (!mode_val.empty())
@@ -2040,7 +2078,7 @@ static int parse_stat_from_node(xmlDocPtr doc, xmlXPathContextPtr ctx, struct st
     uid_t uid = parse_uid_from_node(doc, ctx);
     gid_t gid = parse_gid_from_node(doc, ctx);
 
-    pstat->st_ino = inode_no;
+    pstat->st_ino = (ino_t)(inode_no);
     pstat->st_nlink = 1;
     pstat->st_mode = mode;
     pstat->st_size = size;
@@ -2153,7 +2191,9 @@ static int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathC
 
     // append object name
     is_dir = isCPrefix ? true : false;
-    if(!head.insert(name, is_dir)){
+    string decodeName = urlDecodeSpecial(name);
+
+    if(!head.insert(decodeName, is_dir)){
       S3FS_PRN_ERR("insert_object returns with error.");
       free(name);
       xmlXPathFreeObject(key);
@@ -2173,23 +2213,27 @@ static bool GetXmlNsUrl(xmlDocPtr doc, string& nsurl)
 {
   static time_t tmLast = 0;  // cache for 60 sec.
   static string strNs("");
+  static std::mutex nsMutex;
   bool result = false;
 
   if(!doc){
     return result;
   }
   if((tmLast + 60) < time(NULL)){
-    // refresh
-    tmLast = time(NULL);
-    strNs  = "";
-    xmlNodePtr pRootNode = xmlDocGetRootElement(doc);
-    if(pRootNode){
-      xmlNsPtr* nslist = xmlGetNsList(doc, pRootNode);
-      if(nslist){
-        if(nslist[0] && nslist[0]->href){
-          strNs  = (const char*)(nslist[0]->href);
+    std::lock_guard<std::mutex> lock(nsMutex);
+    if ((tmLast + 60) < time(NULL)){
+      // refresh
+      tmLast = time(NULL);
+      strNs  = "";
+      xmlNodePtr pRootNode = xmlDocGetRootElement(doc);
+      if(pRootNode){
+        xmlNsPtr* nslist = xmlGetNsList(doc, pRootNode);
+        if(nslist){
+          if(nslist[0] && nslist[0]->href){
+            strNs  = (const char*)(nslist[0]->href);
+          }
+          S3FS_XMLFREE(nslist);
         }
-        S3FS_XMLFREE(nslist);
       }
     }
   }
@@ -2557,12 +2601,12 @@ static int set_xattrs_to_header(headers_t& meta, const char* name, const char* v
 
   headers_t::iterator iter;
   if(meta.end() == (iter = meta.find("x-amz-meta-xattr"))){
-    if(XATTR_REPLACE == (flags & XATTR_REPLACE)){
+    if(XATTR_REPLACE == (static_cast<unsigned int>(flags) & XATTR_REPLACE)){
       // there is no xattr header but flags is replace, so failure.
       return -ENOATTR;
     }
   }else{
-    if(XATTR_CREATE == (flags & XATTR_CREATE)){
+    if(XATTR_CREATE == (static_cast<unsigned int>(flags) & XATTR_CREATE)){
       // found xattr header but flags is only creating, so failure.
       return -EEXIST;
     }
@@ -2613,10 +2657,10 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
   timeval begin_tv;
   s3fsStatisStart(SET_XATTR_TOTAL, &begin_tv);
     
-  S3FS_PRN_INFO("cmd start: [path=%s][name=%s][value=%p][size=%zu][flags=%d]", path, name, value, size, flags);
+  S3FS_PRN_INFO("cmd start: [path=%s][name=%s][size=%zu][flags=%d]", path, name, size, flags);
 
   if((value && 0 == size) || (!value && 0 < size)){
-    S3FS_PRN_ERR("Wrong parameter: value(%p), size(%zu)", value, size);
+    S3FS_PRN_ERR("Wrong parameter: value, size(%zu)", size);
     return 0;
   }
 
@@ -2679,7 +2723,7 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
 {    
   timeval begin_tv;
   s3fsStatisStart(GET_XATTR_TOTAL, &begin_tv);
-    
+
   if(!path || !name){
     return -EIO;
   }
@@ -2743,8 +2787,8 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
   }
   free_xattrs(xattrs);
 
-  S3FS_INTF_PRN_LOG("cmd start: [path=%s][name=%s][value=%p][size=%zu],len=%zu",
-    path, name, value, size,length);
+  S3FS_INTF_PRN_LOG("cmd start: [path=%s][name=%s][size=%zu],len=%zu",
+    path, name, size,length);
   s3fsStatisEnd(GET_XATTR_TOTAL, &begin_tv,path);
 
   return static_cast<int>(length);
@@ -2755,7 +2799,7 @@ static int s3fs_listxattr(const char* path, char* list, size_t size)
   timeval begin_tv;
   s3fsStatisStart(LIST_XATTR_TOTAL, &begin_tv);
     
-  S3FS_PRN_INFO("cmd start: [path=%s][list=%p][size=%zu]", path, list, size);
+  S3FS_PRN_INFO("cmd start: [path=%s][size=%zu]", path, size);
 
   if(!path){
     return -EIO;
@@ -2787,9 +2831,9 @@ static int s3fs_listxattr(const char* path, char* list, size_t size)
 
   // calculate total name length
   size_t total = 0;
-  for(xattrs_t::const_iterator iter = xattrs.begin(); iter != xattrs.end(); ++iter){
-    if(0 < iter->first.length()){
-      total += iter->first.length() + 1;
+  for(xattrs_t::const_iterator it = xattrs.begin(); it != xattrs.end(); ++it){
+    if(0 < it->first.length()){
+      total += it->first.length() + 1;
     }
   }
 
@@ -2810,9 +2854,9 @@ static int s3fs_listxattr(const char* path, char* list, size_t size)
 
   // copy to list
   char* setpos = list;
-  for(xattrs_t::const_iterator iter = xattrs.begin(); iter != xattrs.end(); ++iter){
-    if(0 < iter->first.length()){
-      strcpy(setpos, iter->first.c_str());
+  for(xattrs_t::const_iterator it = xattrs.begin(); it != xattrs.end(); ++it){
+    if(0 < it->first.length()){
+      strcpy(setpos, it->first.c_str());
       setpos = &setpos[strlen(setpos) + 1];
     }
   }
@@ -2933,12 +2977,17 @@ static int obsfs_write_successfile()
        return 0;
     }
 
-    uint64_t process_id = (long long )getpid();
-    snprintf(process_id_str, sizeof(process_id_str), "%ld", process_id); 
+    int process_id = getpid();
+    snprintf(process_id_str, sizeof(process_id_str), "%d", process_id);
     success_file_name = success_file_dir + "/" + process_id_str;
 
     umask(S_IXOTH);
-    int success_file = open((const char*)(success_file_name.c_str()), O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+    char resolved_path[PATH_MAX];
+    if(!verifyPath(success_file_name.c_str(), resolved_path, false)) {
+        return -1;
+    }
+
+    int success_file = open((const char*)resolved_path, O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
     if (-1 == success_file){
         S3FS_PRN_ERR("create success_file failed,file_name:%s.", success_file_name.c_str());
         return -1;
@@ -2950,7 +2999,7 @@ static int obsfs_write_successfile()
     	  S3FS_PRN_ERR("write success_file failed,file_name:%s.", success_file_name.c_str());
         ret_code = -1;
     }
-    
+
     (void)fsync(success_file);
     close(success_file);
     S3FS_PRN_INFO("write success_file suceess,file_name:%s,mountpoint:%s.", success_file_name.c_str(), mountpoint.c_str());
@@ -2961,6 +3010,7 @@ static int obsfs_write_successfile()
 static void* s3fs_init(struct fuse_conn_info* conn)
 {
   S3FS_PRN_INIT_INFO("init v%s(commit:%s) with %s", VERSION, COMMIT_HASH_VAL, s3fs_crypt_lib_name());
+
   g_s3fs_start_flag = true;
   if ( 0 != EnableLogService(obsfs_log_file_path,obsfs_log_file_name))
   {
@@ -2972,53 +3022,17 @@ static void* s3fs_init(struct fuse_conn_info* conn)
   //check configure
   HwsConfigure::GetInstance().startThread();
 
+  if (HwsCipherKeyCheck::GetInstance().init(passwd_file) != HwsCipherKeyCheck::SUCCESS_FLAG){
+      S3FS_PRN_EXIT("Could not initialize lastuse file.");
+      s3fs_exit_fuseloop(EXIT_FAILURE);
+      return NULL;
+  }
+
   // cache(remove cache dirs at first)
   if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
       S3FS_PRN_EXIT("Could not initialize cache directory.");
       s3fs_exit_fuseloop(EXIT_FAILURE);
       return NULL;
-  }
-
-  // ssl init
-  if(!s3fs_init_global_ssl()){
-    S3FS_PRN_CRIT("could not initialize for ssl libraries.");
-    s3fs_exit_fuseloop(EXIT_FAILURE);
-    return NULL;
-  }
-
-  // init curl
-  if(!S3fsCurl::InitS3fsCurl("/etc/mime.types")){
-    S3FS_PRN_CRIT("Could not initiate curl library.");
-    s3fs_exit_fuseloop(EXIT_FAILURE);
-    return NULL;
-  }
-
-  // check loading IAM role name
-  if(load_iamrole){
-    S3fsCurl s3fscurl;
-    if(!s3fscurl.LoadIAMRoleFromMetaData()){
-      S3FS_PRN_CRIT("could not load IAM role name from meta data.");
-      s3fs_exit_fuseloop(EXIT_FAILURE);
-      return NULL;
-    }
-    S3FS_PRN_INFO("loaded IAM role name = %s", S3fsCurl::GetIAMRole());
-  }
-
-  if (create_bucket){
-    int result = do_create_bucket();
-    if(result != 0){
-      s3fs_exit_fuseloop(result);
-      return NULL;
-    }
-  }
-
-  // Check Bucket
-  {
-    int result;
-    if(EXIT_SUCCESS != (result = s3fs_check_service())){
-      s3fs_exit_fuseloop(result);
-      return NULL;
-    }
   }
 
   // Investigate system capabilities
@@ -3036,7 +3050,7 @@ static void* s3fs_init(struct fuse_conn_info* conn)
       s3fs_exit_fuseloop(EXIT_FAILURE);
       return NULL;
   }
-  
+
   return NULL;
 }
 
@@ -3045,16 +3059,10 @@ static void s3fs_destroy(void*)
   S3FS_PRN_INFO("destroy");
 
 
-  // Destroy curl
-  if(!S3fsCurl::DestroyS3fsCurl()){
-    S3FS_PRN_WARN("Could not release curl library.");
-  }
   // cache(remove at last)
   if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
     S3FS_PRN_WARN("Could not remove cache directory.");
   }
-  // ssl
-  s3fs_destroy_global_ssl();
 
   //stop all thread
   g_s3fs_start_flag = false;
@@ -3063,6 +3071,8 @@ static void s3fs_destroy(void*)
       S3FS_PRN_INFO("ak sk deamon thread join");  
       g_thread_daemon_.join();
   }
+  // 日志中打印退出
+  S3FS_PRN_CRIT("obsfs:umount.");
   DisableLogService();
 }
 
@@ -3070,14 +3080,15 @@ static int s3fs_access_hw_obs(const char* path, int mask)
 {
   timeval begin_tv;
   s3fsStatisStart(ACCESS_TOTAL, &begin_tv);
+  unsigned int u_mask = static_cast<unsigned int>(mask);
     
   S3FS_PRN_INFO("cmd start: [path=%s][mask=%s%s%s%s]", path,
-          ((mask & R_OK) == R_OK) ? "R_OK " : "",
-          ((mask & W_OK) == W_OK) ? "W_OK " : "",
-          ((mask & X_OK) == X_OK) ? "X_OK " : "",
-          (mask == F_OK) ? "F_OK" : "");
+          ((u_mask & R_OK) == R_OK) ? "R_OK " : "",
+          ((u_mask & W_OK) == W_OK) ? "W_OK " : "",
+          ((u_mask & X_OK) == X_OK) ? "X_OK " : "",
+          (u_mask == F_OK) ? "F_OK" : "");
 
-  int result = check_object_access(path, mask, NULL, NULL);
+  int result = check_object_access(path, u_mask, NULL, NULL);
   s3fsStatisEnd(ACCESS_TOTAL, &begin_tv,path);
 
   return result;
@@ -3293,8 +3304,6 @@ static int s3fs_utility_mode(void)
     S3FS_PRN_EXIT("Could not get list multipart upload.");
     result = EXIT_FAILURE;
   }else{
-    // parse result(incomplete multipart upload information)
-    S3FS_PRN_DBG("response body = {\n%s\n}", body.c_str());
 
     xmlDocPtr doc;
     if(NULL == (doc = xmlReadMemory(body.c_str(), static_cast<int>(body.size()), "", NULL, 0))){
@@ -3367,7 +3376,7 @@ static bool check_region_error(const char* pbody, string& expectregion)
   return true;
 }
 
-static int s3fs_check_service(void)
+static int s3fs_check_service(const std::string& ak, const std::string& sk, const std::string& token)
 {
   S3FS_PRN_INFO("check services.");
 
@@ -3379,7 +3388,7 @@ static int s3fs_check_service(void)
 
   S3fsCurl s3fscurl;
   int      res;
-  if(0 > (res = s3fscurl.CheckBucket())){
+  if(0 > (res = s3fscurl.CheckBucket(ak, sk, token))){
     // get response code
     long responseCode = s3fscurl.GetLastResponseCode();
 
@@ -3391,10 +3400,12 @@ static int s3fs_check_service(void)
       if(check_region_error(body->str(), expectregion)){
         // not specified endpoint, so try to connect to expected region.
         S3FS_PRN_CRIT("Could not connect wrong region %s, so retry to connect region %s.", endpoint.c_str(), expectregion.c_str());
+        std::string errorMsg = std::string("Could not connect wrong region ") + endpoint + ", so retry to connect region " + expectregion + ".";
+        HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
 
         // retry to check with new endpoint
         s3fscurl.DestroyCurlHandle();
-        res          = s3fscurl.CheckBucket();
+        res          = s3fscurl.CheckBucket(ak, sk, token);
         responseCode = s3fscurl.GetLastResponseCode();
       }
     }
@@ -3403,11 +3414,12 @@ static int s3fs_check_service(void)
     if(0 > res && (responseCode == 400 || responseCode == 403) && S3fsCurl::IsSignatureV4()){
       // switch sigv2
       S3FS_PRN_WARN("Could not connect, so retry to connect by signature version 2.");
+      HwsCipherKeyCheck::GetInstance().updateFail("Could not connect, so retry to connect by signature version 2.");
       S3fsCurl::SetSignatureV4(false);
 
       // retry to check with sigv2
       s3fscurl.DestroyCurlHandle();
-      res          = s3fscurl.CheckBucket();
+      res          = s3fscurl.CheckBucket(ak, sk, token);
       responseCode = s3fscurl.GetLastResponseCode();
     }
 
@@ -3415,19 +3427,36 @@ static int s3fs_check_service(void)
     if(0 > res && responseCode != 200 && responseCode != 301){
       if(responseCode == 400){
         S3FS_PRN_CRIT("Bad Request(host=%s) - result of checking service.", host.c_str());
+        std::string errorMsg = std::string("Bad Request(host=") + host + ") - result of checking service.";
+        HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
 
       }else if(responseCode == 403){
         S3FS_PRN_CRIT("invalid credentials(host=%s) - result of checking service.", host.c_str());
+        std::string errorMsg = std::string("invalid credentials(host=") + host + ") - result of checking service.";
+        HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
+        return EACCES;
 
       }else if(responseCode == 404){
         S3FS_PRN_CRIT("bucket not found(host=%s) - result of checking service.", host.c_str());
+        std::string errorMsg = std::string("bucket not found(host=") + host + ") - result of checking service.";
+        HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
+        // The specified bucket does not exist.
+        return ENXIO;
+
+      }else if(responseCode == 405){
+        // file system not support this request: this bucket not support filesystem.
+        return EPERM;
 
       }else if(responseCode == CURLE_OPERATION_TIMEDOUT){
         // unable to connect
         S3FS_PRN_CRIT("unable to connect bucket and timeout(host=%s) - result of checking service.", host.c_str());
+        std::string errorMsg = std::string("unable to connect bucket and timeout(host=") + host + ") - result of checking service.";
+        HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
       }else{
         // another error
         S3FS_PRN_CRIT("unable to connect(host=%s) - result of checking service.", host.c_str());
+        std::string errorMsg = std::string("unable to connect(host=") + host + ") - result of checking service.";
+        HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
       }
       return EXIT_FAILURE;
     }
@@ -3437,10 +3466,14 @@ static int s3fs_check_service(void)
   if(mount_prefix.size() > 0){
     if(s3fscurl.getMountPrefixInode() != 0){
       S3FS_PRN_CRIT("get mountpath %s RootInodeNo failed.", mount_prefix.c_str());
+      std::string errorMsg = std::string("get mountpath ") + mount_prefix + " RootInodeNo failed.";
+      HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
       return EXIT_FAILURE;
     }
     if(remote_mountpath_exists(mount_prefix.c_str()) != 0){
       S3FS_PRN_CRIT("remote mountpath %s not found.", mount_prefix.c_str());
+      std::string errorMsg = std::string("remote mountpath ") + mount_prefix + " not found.";
+      HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
       return EXIT_FAILURE;
     }
   }
@@ -3472,8 +3505,13 @@ static int parse_passwd_file(bucketkvmap_t& resmap)
   readline_t linelist;
   readline_t::iterator iter;
 
+  char resolved_path[PATH_MAX];
+  if(!verifyPath(passwd_file.c_str(), resolved_path, true)) {
+    return -1;
+  }
+
   // open passwd file
-  ifstream PF(passwd_file.c_str());
+  ifstream PF(resolved_path);
   if(!PF.good()){
     S3FS_PRN_EXIT("could not open passwd file : %s", passwd_file.c_str());
     return -1;
@@ -3525,50 +3563,58 @@ static int parse_passwd_file(bucketkvmap_t& resmap)
   // The open-source s3fs format (bucket:accesskey:secretkey) is not supported.
   for(iter = linelist.begin(); iter != linelist.end(); ++iter){
     int count_colon = std::count(iter->begin(),iter->end(),':');
-    string bucket;
-    string accesskey;
-    string secretkey;
+    string bucketKey;
+    string accessKey;
+    string secretKey;
     string token;
     first_pos = iter->find_first_of(":");
     last_pos  = iter->find_last_of(":");
     switch (count_colon) {
       case 1:
         // formatted by "accesskey:secretkey"
-        bucket    = allbucket_fields_type;
-        accesskey = trim(iter->substr(0, first_pos));
-        secretkey = trim(iter->substr(first_pos + 1, string::npos));
+        bucketKey    = allbucket_fields_type;
+        accessKey = trim(iter->substr(0, first_pos));
+        secretKey = trim(iter->substr(first_pos + 1, string::npos));
         break;
       case 2:
         // formatted by "accesskey:secretkey:token"
-        bucket    = allbucket_fields_type;
-        accesskey = trim(iter->substr(0, first_pos));
-        secretkey = trim(iter->substr(first_pos + 1, last_pos - first_pos - 1));
+        bucketKey    = allbucket_fields_type;
+        accessKey = trim(iter->substr(0, first_pos));
+        secretKey = trim(iter->substr(first_pos + 1, last_pos - first_pos - 1));
         token     = trim(iter->substr(last_pos + 1, string::npos));
 
         if(token.empty()){
-          S3FS_PRN_EXIT("Invalid passwd format: missing content.(Token) AK: %s, SK: %s",
-                        accesskey.c_str(), secretkey.c_str());
+          S3FS_PRN_EXIT("Invalid passwd format: missing content.(Token) AK: %s", accessKey.c_str());
+          std::string errorMsg = "Invalid passwd format: missing content.(Token) AK: " + accessKey;
+          HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
           return -1;
         }
         break;
       default:
         S3FS_PRN_EXIT("Invalid passwd format: contains too many or too few colons.");
+        HwsCipherKeyCheck::GetInstance().updateFail("Invalid passwd format: contains too many or too few colons.");
         return -1;
     }
-    if(accesskey.empty() || secretkey.empty()){
+    if(accessKey.empty() || secretKey.empty()){
       S3FS_PRN_EXIT("Invalid passwd format: missing content.(AK or SK)");
+      HwsCipherKeyCheck::GetInstance().updateFail("Invalid passwd format: missing content.(AK or SK)");
       return -1;
     }
 
-    if(resmap.end() != resmap.find(bucket)){
-      S3FS_PRN_EXIT("same bucket(%s) passwd setting found in passwd file.", ("" == bucket ? "default" : bucket.c_str()));
+    if(resmap.end() != resmap.find(bucketKey)){
+      S3FS_PRN_EXIT("same bucket(%s) passwd setting found in passwd file.", ("" == bucketKey ? "default" : bucketKey.c_str()));
+      std::string errorMsg = "same bucket(" + std::string("" == bucketKey ? "default" : bucketKey.c_str()) + ") passwd setting found in passwd file.";
+      HwsCipherKeyCheck::GetInstance().updateFail(errorMsg.c_str());
       return -1;
     }
+
     kv.clear();
-    kv[string(aws_accesskeyid)] = accesskey;
-    kv[string(aws_secretkey)]   = secretkey;
-    resmap[bucket]              = kv;
-    S3FS_PRN_INFO("new AKSK in passwd file, AK: %s, SK: %s", accesskey.c_str(), secretkey.c_str())
+    kv[string(aws_accesskeyid)] = accessKey;
+    kv[string(aws_secretkey)] = secretKey;
+    kv[string(aws_token)] = token;
+
+    resmap[bucket] = kv;
+    S3FS_PRN_INFO("new AKSK in passwd file, AK: %s.", accessKey.c_str());
   }
   return (resmap.empty() ? 0 : 1);
 }
@@ -3677,28 +3723,35 @@ static void update_aksk(void)
 //
 // compare the new ak/sk and the old
 //
-static bool is_aksk_same(const string strAccessKey, const string strSecretKey)
+static bool is_aksktoken_same(const string strAccessKey, const string strSecretKey, const string strToken)
 {
     string strAKOld = "";
     string strSKOld = "";
+    string strTokenOld = "";
 
     if(strAccessKey == "" || strSecretKey == ""){
         S3FS_PRN_WARN(" access key or secret key  is not specified.");
         return false;
     }
-    if(!S3fsCurl::GetAccessKey(strAKOld, strSKOld)){
+    if(!S3fsCurl::GetAccessKeyAndToken(strAKOld, strSKOld, strTokenOld)){
         S3FS_PRN_WARN("failed to Get access key/secret key from curl.");
         return false;
     }
 
-    if(strAKOld != strAccessKey || strSKOld != strSecretKey){
-		S3FS_PRN_WARN("ak or sk change");
+    if(strAKOld != strAccessKey || strSKOld != strSecretKey || strTokenOld != strToken){
+        S3FS_PRN_WARN("ak or sk or token change");
         return false;
     }
     else{
         return true;
     }
 }
+
+static bool is_aksk_same(const string strAccessKey, const string strSecretKey)
+{
+    return is_aksktoken_same(strAccessKey, strSecretKey, "");
+}
+
 
 //
 // read_passwd_file
@@ -3721,7 +3774,7 @@ static int read_passwd_file(void)
   bucketkvmap_t bucketmap;
   kvmap_t       keyval;
   int           result;
-  bool          IsSame;
+  bool          IsAkSkTokenSame;
 
   // if you got here, the password file
   // exists and is readable by the
@@ -3765,16 +3818,28 @@ static int read_passwd_file(void)
     S3FS_PRN_EXIT("Not found access key/secret key in passwd file.");
     return EXIT_FAILURE;
   }
-  IsSame = is_aksk_same(keyval.at(string(aws_accesskeyid)).c_str(), keyval.at(string(aws_secretkey)).c_str());
+  IsAkSkTokenSame = is_aksktoken_same(keyval.at(string(aws_accesskeyid)).c_str(),
+          keyval.at(string(aws_secretkey)).c_str(), keyval.at(string(aws_token)).c_str());
 
-  if(!IsSame){
-    if(!S3fsCurl::SetAccessKey(keyval.at(string(aws_accesskeyid)).c_str(), keyval.at(string(aws_secretkey)).c_str())){
-        S3FS_PRN_WARN("failed to set internal data for access key/secret key from passwd file.");
+  if(!IsAkSkTokenSame){
+      // checking before updating the aksktoken
+      if (HwsCipherKeyCheck::GetInstance().isReady()) {
+          if (EXIT_SUCCESS != s3fs_check_service(keyval.at(string(aws_accesskeyid)).c_str(), keyval.at(string(aws_secretkey)).c_str(),
+                                  keyval.at(string(aws_token)).c_str())){
+              return EXIT_FAILURE;
+          }
+      }
+    if(!S3fsCurl::SetAccessKeyAndToken(keyval.at(string(aws_accesskeyid)).c_str()
+            , keyval.at(string(aws_secretkey)).c_str()
+            ,keyval.at(string(aws_token)).c_str())){
+        S3FS_PRN_WARN("failed to set internal data for access key/secret key/token from passwd file.AK:%s"
+                ,keyval.at(string(aws_accesskeyid)).c_str());
+        HwsCipherKeyCheck::GetInstance().updateFail("failed to set internal data for access key/secret key/token from passwd file");
         return EXIT_FAILURE;
     }
-    S3FS_PRN_WARN("AKSK is updated successfully. AK:%s SK:%s", keyval.at(string(aws_accesskeyid)).c_str(),
-                  keyval.at(string(aws_secretkey)).c_str());
+    S3FS_PRN_WARN("AKSK is updated successfully. AK:%s", keyval.at(string(aws_accesskeyid)).c_str());
   }
+  HwsCipherKeyCheck::GetInstance().updateSuccess();
 
   return EXIT_SUCCESS;
 }
@@ -3803,15 +3868,22 @@ static int get_access_keys(void)
   if(load_iamrole || is_ecs){
      return EXIT_SUCCESS;
   }
+
+  char resolved_path[PATH_MAX];
   // 1 - was specified on the command line
   if(passwd_file.size() > 0){
-    ifstream PF(passwd_file.c_str());
+      if(!verifyPath(passwd_file.c_str(), resolved_path, true)) {
+          S3FS_PRN_EXIT("specified passwd_file is not readable.");
+          return ENOENT;
+      }
+
+      ifstream PF(resolved_path);
     if(PF.good()){
        PF.close();
        return read_passwd_file();
     }else{
       S3FS_PRN_EXIT("specified passwd_file is not readable.");
-      return EXIT_FAILURE;
+      return ENOENT;
     }
   }
 
@@ -3821,7 +3893,10 @@ static int get_access_keys(void)
   if(HOME != NULL){
      passwd_file.assign(HOME);
      passwd_file.append("/.passwd-s3fs");
-     ifstream PF(passwd_file.c_str());
+     if(!verifyPath(passwd_file.c_str(), resolved_path, true)) {
+       return EXIT_FAILURE;
+     }
+     ifstream PF(resolved_path);
      if(PF.good()){
        PF.close();
        if(EXIT_SUCCESS != read_passwd_file()){
@@ -3838,7 +3913,10 @@ static int get_access_keys(void)
 
   // 3 - from the system default location
   passwd_file.assign("/etc/passwd-s3fs");
-  ifstream PF(passwd_file.c_str());
+  if(!verifyPath(passwd_file.c_str(), resolved_path, true)) {
+    return EXIT_FAILURE;
+  }
+  ifstream PF(resolved_path);
   if(PF.good()){
     PF.close();
     return read_passwd_file();
@@ -3941,14 +4019,17 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
 
       if(stat(arg, &stbuf) == -1){
         S3FS_PRN_EXIT("unable to access MOUNTPOINT %s: %s", mountpoint.c_str(), strerror(errno));
+        s3fs_init_deferred_exit_status = EBUSY;
         return -1;
       }
       if(!(S_ISDIR(stbuf.st_mode))){
         S3FS_PRN_EXIT("MOUNTPOINT: %s is not a directory.", mountpoint.c_str());
+        s3fs_init_deferred_exit_status = ENOTDIR;
         return -1;
       }
       if(!set_mountpoint_attribute(stbuf)){
         S3FS_PRN_EXIT("MOUNTPOINT: %s permission denied.", mountpoint.c_str());
+        s3fs_init_deferred_exit_status = EPERM;
         return -1;
       }
 
@@ -3957,12 +4038,14 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
         DIR *dp = opendir(mountpoint.c_str());
         if(dp == NULL){
           S3FS_PRN_EXIT("failed to open MOUNTPOINT: %s: %s", mountpoint.c_str(), strerror(errno));
+          s3fs_init_deferred_exit_status = EBADF;
           return -1;
         }
         while((ent = readdir(dp)) != NULL){
           if(strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0){
             closedir(dp);
             S3FS_PRN_EXIT("MOUNTPOINT directory %s is not empty. if you are sure this is safe, can use the 'nonempty' mount option.", mountpoint.c_str());
+            s3fs_init_deferred_exit_status = ENOTEMPTY;
             return -1;
           }
         }
@@ -3999,7 +4082,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       return 1; // continue for fuse option
     }
     if(0 == STR2NCMP(arg, "umask=")){
-      s3fs_umask = strtol(strchr(arg, '=') + sizeof(char), NULL, 0);
+      s3fs_umask = (mode_t)(strtol(strchr(arg, '=') + sizeof(char), NULL, 0));
       s3fs_umask &= (S_IRWXU | S_IRWXG | S_IRWXO);
       is_s3fs_umask = true;
       return 1; // continue for fuse option
@@ -4009,7 +4092,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       return 1; // continue for fuse option
     }
     if(0 == STR2NCMP(arg, "mp_umask=")){
-      mp_umask = strtol(strchr(arg, '=') + sizeof(char), NULL, 0);
+      mp_umask = (mode_t)(strtol(strchr(arg, '=') + sizeof(char), NULL, 0));
       mp_umask &= (S_IRWXU | S_IRWXG | S_IRWXO);
       is_mp_umask = true;
       return 0;
@@ -4020,7 +4103,12 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       return 0;
     }
     if(0 == STR2NCMP(arg, "retries=")){
-      S3fsCurl::SetRetries(static_cast<int>(s3fs_strtoofft(strchr(arg, '=') + sizeof(char))));
+      int retry_times = static_cast<int>(s3fs_strtoofft(strchr(arg, '=') + sizeof(char)));
+      if(retry_times < 1 || retry_times > MAX_RETRY_TIMES) {
+          S3FS_PRN_EXIT("retry times must be between 1 and %d.", MAX_RETRY_TIMES);
+          return -1;
+      }
+      S3fsCurl::SetRetries(retry_times);
       return 0;
     }
     if(0 == STR2NCMP(arg, "use_cache=")){
@@ -4205,16 +4293,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
       success_file_dir = strchr(arg, '=') + sizeof(char);
       return 0;
     }
-    
-    if(0 == strcmp(arg, "ibm_iam_auth")){
-      S3fsCurl::SetIsIBMIAMAuth(true);
-      S3fsCurl::SetIAMCredentialsURL("https://iam.bluemix.net/oidc/token");
-      S3fsCurl::SetIAMTokenField("access_token");
-      S3fsCurl::SetIAMExpiryField("expiration");
-      S3fsCurl::SetIAMFieldCount(2);
-      is_ibm_iam_auth = true;
-      return 0;
-    }
+
     if(0 == strcmp(arg, "ecs")){
       if (is_ibm_iam_auth) {
         S3FS_PRN_EXIT("option ecs cannot be used in conjunction with ibm");
@@ -4270,10 +4349,18 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == STR2NCMP(arg, "host=")){
       host = strchr(arg, '=') + sizeof(char);
+      if(host.size() == 0 || host.size() > MAX_OBS_URL_LENGTH) {
+        S3FS_PRN_EXIT("host's length must be between 1,%d.", MAX_OBS_URL_LENGTH);
+        return -1;
+      }
       return 0;
     }
     if(0 == STR2NCMP(arg, "servicepath=")){
       service_path = strchr(arg, '=') + sizeof(char);
+      if(service_path.size() > MAX_OBS_FILEPATH_LENGTH) {
+        S3FS_PRN_EXIT("service_path's length must be between 0,%d.", MAX_OBS_FILEPATH_LENGTH);
+        return -1;
+      }
       return 0;
     }
     if(0 == strcmp(arg, "no_check_certificate")){
@@ -4282,11 +4369,19 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == STR2NCMP(arg, "connect_timeout=")){
       long contimeout = static_cast<long>(s3fs_strtoofft(strchr(arg, '=') + sizeof(char)));
+      if(contimeout < 1 || contimeout > CONNECT_TIMEOUT) {
+        S3FS_PRN_EXIT("connect_timeout must be between 1,%d.", CONNECT_TIMEOUT);
+        return -1;
+      }
       S3fsCurl::SetConnectTimeout(contimeout);
       return 0;
     }
     if(0 == STR2NCMP(arg, "readwrite_timeout=")){
       time_t rwtimeout = static_cast<time_t>(s3fs_strtoofft(strchr(arg, '=') + sizeof(char)));
+      if(rwtimeout < 1 || rwtimeout > READWRITE_TIMEOUT) {
+        S3FS_PRN_EXIT("readwrite_timeout must be between 1,%d.", READWRITE_TIMEOUT);
+        return -1;
+      }
       S3fsCurl::SetReadwriteTimeout(rwtimeout);
       return 0;
     }
@@ -4344,8 +4439,8 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == STR2NCMP(arg, "hwcache_write_size=")){
       size_t size = static_cast<size_t>(s3fs_strtoofft(strchr(arg, '=') + sizeof(char)));
-      if(size <= 0){
-        S3FS_PRN_EXIT("hwcache_write_size option should be over 0.");
+      if(size < MIN_HWCACHE_WRITE_SIZE || size > MAX_HWCACHE_WRITE_SIZE){
+        S3FS_PRN_EXIT("hwcache_write_size must be between %d,%d.", MIN_HWCACHE_WRITE_SIZE, MAX_HWCACHE_WRITE_SIZE);
         return -1;
       }
       gWritePageSize = size;
@@ -4399,6 +4494,10 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == STR2NCMP(arg, "url=")){
       host = strchr(arg, '=') + sizeof(char);
+      if(host.size() == 0 || host.size() > MAX_OBS_URL_LENGTH) {
+        S3FS_PRN_EXIT("url's length must be between 1,%d.", MAX_OBS_URL_LENGTH);
+        return -1;
+      }
       // strip the trailing '/', if any, off the end of the host
       // string
       size_t found, length;
@@ -4521,10 +4620,11 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == STR2NCMP(arg, "maxcachesize=")){
         off64_t maxCacheSize = strtol(strchr(arg, '=') + sizeof(char), NULL, 0);
-        if (maxCacheSize > 0)
-        {
-            gMaxCacheMemSize = maxCacheSize;
+        if(maxCacheSize < MIN_CACHE_SIZE || maxCacheSize > MAX_CACHE_SIZE ) {
+          S3FS_PRN_EXIT("maxcachesize must be between %d,%d.", MIN_CACHE_SIZE, MAX_CACHE_SIZE);
+          return -1;
         }
+        gMaxCacheMemSize = maxCacheSize;
         S3FS_PRN_WARN("maxCacheSize = %ld", gMaxCacheMemSize);
         return 0;
       }
@@ -4535,10 +4635,11 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
     }
     if(0 == STR2NCMP(arg, "resolveretrymax=")){
         off64_t retryCount = strtol(strchr(arg, '=') + sizeof(char), NULL, 0);
-        if (retryCount > 0)
-        {
-            gCliCannotResolveRetryCount = retryCount;
+        if(retryCount < 1 || retryCount > MAX_RESOLVE_RETRY) {
+          S3FS_PRN_EXIT("resolveretrymax must be between 1,%d.", MAX_RESOLVE_RETRY);
+          return -1;
         }
+        gCliCannotResolveRetryCount = retryCount;
         S3FS_PRN_WARN("gCliCannotResolveRetryCount = %d", gCliCannotResolveRetryCount);
         return 0;
     }
@@ -4555,6 +4656,7 @@ static int my_fuse_opt_proc(void* data, const char* arg, int key, struct fuse_ar
   }
   return 1;
 }
+
 
 static int s3fs_utimens_hw_obs(const char* path, const struct timespec ts[2])
 {
@@ -4706,7 +4808,7 @@ bool isReadBeyondCacheStatFileSize(const char* path,tag_index_cache_entry_t*
 {
     off64_t cacheFileSize = pIndexEntry->stGetAttrStat.st_size;
     
-    S3FS_PRN_INFO("path=%s,cacheFilesize=%ld,readoff=%lu", 
+    S3FS_PRN_INFO("path=%s,cacheFilesize=%ld,readoff=%lu",
         path,cacheFileSize,read_offset);
 
     //if cache get attr stat valid and read offset beyond filesize
@@ -4716,7 +4818,7 @@ bool isReadBeyondCacheStatFileSize(const char* path,tag_index_cache_entry_t*
         //only for statis return true count
         timeval begin_tv;
         s3fsStatisStart(READ_BEYOND_STAT_FILE_SIZE, &begin_tv);
-        S3FS_DATA_CACHE_PRN_LOG("statCache,beyond size,path=%s,cacheFilesize=%ld,readoff=%lu", 
+        S3FS_DATA_CACHE_PRN_LOG("statCache,beyond size,path=%s,cacheFilesize=%ld,readoff=%lu",
             path,cacheFileSize,read_offset);
         s3fsStatisEnd(READ_BEYOND_STAT_FILE_SIZE, &begin_tv);
         return true;
@@ -4743,6 +4845,7 @@ void copyGetAttrStatToCacheEntry(
 {
     if (0 == HwsGetIntConfigValue(HWS_CFG_CACHE_ATTR_SWITCH_OPEN))
     {
+        memcpy(&(p_dest_cache_entry->stGetAttrStat), pSrcStat, sizeof(struct stat));
         return;
     }
 
@@ -4752,6 +4855,7 @@ void copyGetAttrStatToCacheEntry(
     }
     else
     {
+        memcpy(&(p_dest_cache_entry->stGetAttrStat), pSrcStat, sizeof(struct stat));
         S3FS_PRN_INFO("path=%s,filesize zero,not copy",path);
     }
 }
@@ -4773,7 +4877,7 @@ static void init_index_cache_entry(tag_index_cache_entry_t &index_cache_entry)
 
     index_cache_entry.statType = STAT_TYPE_BUTT;
 
-    memset(&index_cache_entry.stGetAttrStat, 0, sizeof(struct stat));    
+    memset(&index_cache_entry.stGetAttrStat, 0, sizeof(struct stat));
     memset(&index_cache_entry.getAttrCacheSetTs, 0, sizeof(struct timespec));    
 }
 
@@ -4852,7 +4956,7 @@ void adjust_filesize_with_write_cache(const char* path,
 //output para:pstbuf,pheader,inodeNo,p_index_cache_entry,
 //            headLastResponseCode(200 for ok)
 static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct stat* pstbuf,
-    headers_t* pmeta, long long* inodeNo, bool openflag, tag_index_cache_entry_t* p_index_cache_entry, 
+    headers_t* pmeta, long long* inodeNo, bool openflag, tag_index_cache_entry_t* p_index_cache_entry,
     long* headLastResponseCode, bool useIndexCache)
 {
     //timeval object_tv;
@@ -4869,7 +4973,7 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
 
     S3FS_PRN_DBG("[path=%s]", path);
 
-    if(!path || '\0' == path[0]){
+    if (!path || '\0' == path[0]) {
       return -ENOENT;
     }
 
@@ -4907,6 +5011,17 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
             {
                 fillGetAttrStatInfoFromCacheEntry(p_cache_entry, pstat);
                 // do after process: copy inodeNo, set response code, add open count if need.
+                std::shared_ptr <HwsFdEntity> ent = HwsFdManager::GetInstance().Get(pstat->st_ino);
+                if (nullptr != ent) {
+                    S3FS_PRN_INFO("[path=%s] read file size from HwsFdEntity, pstat->st_size=%ld, FdEntity->size=%ld.",
+                                  strpath.c_str(), pstat->st_size, ent->GetFileSize());
+                    if (ent->GetFileSize() != pstat->st_size) {
+                        IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(strpath, ent->GetFileSize(), false);
+                    }
+                } else {
+                    S3FS_PRN_INFO("[path=%s] cache error, entity is None, pstat->st_size=%ld",
+                                  strpath.c_str(), pstat->st_size);
+                }
                 afterCopyFromCacheEntryProcess(path, inodeNo, headLastResponseCode, p_cache_entry, openflag);
 
                 return 0;
@@ -5018,7 +5133,7 @@ static int get_object_attribute_with_open_flag_hw_obs(const char* path, struct s
         {
             *inodeNo = p_cache_entry->inodeNo;
         }
-        pstat->st_ino = p_cache_entry->inodeNo;
+        pstat->st_ino = (ino_t)(p_cache_entry->inodeNo);
         /*adjust file size with write page list*/
         adjust_filesize_with_write_cache(path, p_cache_entry->inodeNo,pstat);        
         //copy pstat to p_cache_entry
@@ -5090,12 +5205,12 @@ static int s3fs_getattr_hw_obs(const char* path, struct stat* pstbuf)
     {
         pstbuf->st_size = pstbuf->st_blksize;
     }
-	
+
     s3fsStatisEnd(GETATTR_DELAY, &begin_tv);
     timeval      end_tv;
     gettimeofday(&end_tv, NULL);
     unsigned long long diff = getDiffUs(&begin_tv,&end_tv);
-    S3FS_INTF_PRN_LOG("cmd start: [path=%s],mode=%x,diff=%llu us", 
+    S3FS_INTF_PRN_LOG("cmd start: [path=%s],mode=%x,diff=%llu us",
         path,(unsigned int)pstbuf->st_mode,diff);
 
     return result;
@@ -5171,8 +5286,26 @@ static int create_file_object_hw_obs(const char* path, mode_t mode, uid_t uid, g
     return result;
 }
 
+//  validate file path length, maximum value is 1024
+static int validate_filepath_length(const char* path)
+{
+    std::string fullPath = mount_prefix + path;
+    size_t full_path_size = fullPath.size() - 1;
+    if(full_path_size > MAX_PATH_LENGTH) {
+        S3FS_PRN_ERR(" path length exceeds maximum, [path=%s][size=%zu]", fullPath.c_str(), full_path_size);
+        return -ENAMETOOLONG;
+    }
+    return 0;
+}
+
 static int s3fs_create_hw_obs(const char* path, mode_t mode, struct fuse_file_info* fi)
 {
+    int validateLengthResult = validate_filepath_length(path);
+    if( validateLengthResult != 0) {
+        S3FS_PRN_ERR("create: target path length exceeds maximum, abort [path=%s][result=%d]", path, validateLengthResult);
+        return validateLengthResult;
+    }
+
     int result;
     struct fuse_context* pcxt;
     long long inodeNo = INVALID_INODE_NO;
@@ -5195,7 +5328,7 @@ static int s3fs_create_hw_obs(const char* path, mode_t mode, struct fuse_file_in
     if (0 == result)
     {
         S3FS_PRN_WARN("file exists, [path=%s]", path);
-        fi->fh = inodeNo;
+        fi->fh = (uint64_t)(inodeNo);
         if(!nohwscache)
         {
             HwsFdManager::GetInstance().Open(path, inodeNo, 0);
@@ -5224,7 +5357,7 @@ static int s3fs_create_hw_obs(const char* path, mode_t mode, struct fuse_file_in
     }
     else
     {
-        fi->fh = inodeNo;        //return fi->fh
+        fi->fh = (uint64_t)(inodeNo);        //return fi->fh
         //S3FS_MALLOCTRIM(0);
         if(!nohwscache)
         {
@@ -5246,7 +5379,7 @@ static int s3fs_open_hw_obs(const char* path, struct fuse_file_info* fi)
     timeval begin_tv;
     s3fsStatisStart(OPEN_FILE_TOTAL, &begin_tv);
 
-    int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK);
+    unsigned int mask = (O_RDONLY != ((unsigned int)fi->flags & O_ACCMODE) ? W_OK : R_OK);
     result = check_object_access_with_openflag(path, mask, &st, &inodeNo, true);
     if (-ENOENT == result)
     {
@@ -5274,7 +5407,7 @@ static int s3fs_open_hw_obs(const char* path, struct fuse_file_info* fi)
     }
     s3fsStatisEnd(OPEN_FILE_TOTAL, &begin_tv);
 
-    fi->fh = inodeNo;                       //return fi->fh
+    fi->fh = (uint64_t)(inodeNo);                       //return fi->fh
     if(!nohwscache)
     {
         HwsFdManager::GetInstance().Open(path, inodeNo, static_cast<off64_t>(st.st_size));
@@ -5407,7 +5540,7 @@ static int s3fs_write_hw_obs(const char* path,
 
     s3fsStatisEnd(WRITE_FILE_TOTAL, &begin_tv,path);
     //set filesize to cache get attr stat after write succeed
-    IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(str_path,offset+size,false);
+    IndexCache::getIndexCache()->setFilesizeOrClearGetAttrStat(str_path,offset+size,false, STAT_TYPE_HEAD);
     return static_cast<int>(size);
 }
 /* add for object_file_gateway end */
@@ -5570,7 +5703,7 @@ static int s3fs_release_hw_obs(const char* path, struct fuse_file_info* fi)
 static int s3fs_opendir_hw_obs(const char* path, struct fuse_file_info* fi)
 {
   int result;
-  int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK) | X_OK;
+  unsigned int mask = (O_RDONLY != ((unsigned int)fi->flags & O_ACCMODE) ? W_OK : R_OK) | X_OK;
   long long inodeNo = INVALID_INODE_NO;
   timeval begin_tv;
   s3fsStatisStart(OPENDIR_TOTAL, &begin_tv);
@@ -5583,7 +5716,7 @@ static int s3fs_opendir_hw_obs(const char* path, struct fuse_file_info* fi)
     result = check_parent_object_access(path, mask);
   }
 
-  fi->fh = inodeNo;
+  fi->fh = (uint64_t)(inodeNo);
 
   s3fsStatisEnd(OPENDIR_TOTAL, &begin_tv,path);
   return result;
@@ -5592,7 +5725,7 @@ static int s3fs_opendir_hw_obs(const char* path, struct fuse_file_info* fi)
 /* file gateway modify begin */
 static int readdir_get_ino(const char* path, struct fuse_file_info* fi, long long& inode_no)
 {
-  long long ino = fi->fh;
+  long long ino = (long long)(fi->fh);
   
   if(INVALID_INODE_NO == ino){
     int result = check_object_access(path, X_OK, NULL, &ino);
@@ -5727,17 +5860,24 @@ static void add_list_result_to_filler(const char* path, string dentryPrefix, S3H
         index_cache_entry.inodeNo = it->second.st_ino;
         index_cache_entry.dentryname = dentryPrefix + it->first;
 
+        copyStatToCacheEntry(dispath.c_str(), &index_cache_entry, const_cast<struct stat*>(&(it->second)), STAT_TYPE_LIST);
+
+        // query the IndexCache to determine whether to update the IndexCache
+        tag_index_cache_entry_t p_cache_entry;
+        bool result = IndexCache::getIndexCache()->GetIndex(dispath, &p_cache_entry);
+
         std::shared_ptr<HwsFdEntity> ent = HwsFdManager::GetInstance().Get(index_cache_entry.inodeNo);
         if (ent != nullptr)
         {
             off64_t fileSize = ent->GetFileSize();
             index_cache_entry.stGetAttrStat.st_size = max(fileSize, it->second.st_size);
         }
-        
-        copyStatToCacheEntry(dispath.c_str(), &index_cache_entry, const_cast<struct stat*>(&(it->second)), STAT_TYPE_LIST);
-
-        IndexCache::getIndexCache()->PutIndexNotchangeOpenCnt(dispath, &index_cache_entry);
-
+        // if the result is 0, that mean the IndexCache not exist, so update IndexCache
+        // if the IndexCache is exist, and statType is STAT_TYPE_HEAD and cache valid, can not update IndexCache
+        // because within the cache valid period, list can not update head cache
+        if (!result || !(p_cache_entry.statType == STAT_TYPE_HEAD && isCacheGetAttrStatValid(dispath.c_str(), &p_cache_entry))){
+            IndexCache::getIndexCache()->PutIndexNotchangeOpenCnt(dispath, &index_cache_entry);
+        }
         S3FS_PRN_INFO2("[offset=%ld,filename=%s,filemode=%o,filesize=%llu,uid=%ld,gid=%ld,mtime=%s]",
           offset, it->first.c_str(), it->second.st_mode, (long long)it->second.st_size, (long)it->second.st_uid, (long)it->second.st_gid, ctime(&it->second.st_mtime));
 
@@ -5826,6 +5966,12 @@ static int create_directory_object_hw_obs(const char* path, mode_t mode, time_t 
 
 static int s3fs_mkdir_hw_obs(const char* path, mode_t mode)
 {
+  int validateLengthResult = validate_filepath_length(path);
+  if( validateLengthResult != 0) {
+    S3FS_PRN_ERR("mkdir: target path length exceeds maximum, abort [path=%s][result=%d]", path, validateLengthResult);
+    return validateLengthResult;
+  }
+
   int result;
   struct fuse_context* pcxt;
   timeval begin_tv;
@@ -5860,7 +6006,7 @@ static int s3fs_unlink_hw_obs(const char* path)
   int result;
   timeval begin_tv;
   s3fsStatisStart(UNLINK_TOTAL, &begin_tv);
-  
+
   S3FS_PRN_INFO("cmd start: [path=%s]", path);
 
   // check dir
@@ -6132,6 +6278,9 @@ int main(int argc, char* argv[])
   struct fuse_args custom_args = FUSE_ARGS_INIT(argc, argv);
   if(0 != fuse_opt_parse(&custom_args, NULL, NULL, my_fuse_opt_proc)){
     S3FS_PRN_EXIT("fuse_opt_parse fail");
+    if (s3fs_init_deferred_exit_status != 0){
+        exit(s3fs_init_deferred_exit_status);
+    }
     exit(EXIT_FAILURE);
   }
 
@@ -6189,8 +6338,9 @@ int main(int argc, char* argv[])
     exit(EXIT_FAILURE);
   }
   if(!S3fsCurl::IsPublicBucket() && !load_iamrole && !is_ecs){
-    if(EXIT_SUCCESS != get_access_keys()){
-      exit(EXIT_FAILURE);
+    int key_res = get_access_keys();
+    if(EXIT_SUCCESS != key_res){
+      exit(key_res);
     }
     if(!S3fsCurl::IsSetAccessKeys()){
       S3FS_PRN_EXIT("could not establish security credentials, check documentation.");
@@ -6266,6 +6416,43 @@ int main(int argc, char* argv[])
     exit(EXIT_FAILURE);
   }
 
+  // ssl init
+  if(!s3fs_init_global_ssl()){
+      S3FS_PRN_EXIT("could not initialize for ssl libraries.");
+      exit(EXIT_FAILURE);
+  }
+
+  // init curl
+  if(!S3fsCurl::InitS3fsCurl("/etc/mime.types")){
+      S3FS_PRN_CRIT("Could not initiate curl library.");
+      exit(EXIT_FAILURE);
+  }
+
+  // check loading IAM role name
+  if(load_iamrole){
+      S3fsCurl s3fscurl;
+      if(!s3fscurl.LoadIAMRoleFromMetaData()){
+          S3FS_PRN_CRIT("could not load IAM role name from meta data.");
+          exit(EXIT_FAILURE);
+      }
+      S3FS_PRN_INFO("loaded IAM role name = %s", S3fsCurl::GetIAMRole());
+  }
+
+  if (create_bucket){
+      int result = do_create_bucket();
+      if(result != 0){
+          exit(EXIT_FAILURE);
+      }
+  }
+
+  // Check Bucket
+  {
+      int result;
+      if(EXIT_SUCCESS != (result = s3fs_check_service())){
+          exit(result);
+      }
+  }
+
   init_oper(s3fs_oper);
   InitStatis();
 
@@ -6275,16 +6462,25 @@ int main(int argc, char* argv[])
   if(!set_s3fs_usr2_handler()){
     S3FS_PRN_EXIT("could not set signal handler for SIGUSR2.");
     clearStatis();
+    S3fsCurl::DestroyS3fsCurl();
+    s3fs_destroy_global_ssl();
     exit(EXIT_FAILURE);
   }
 
-  //check configure, add by g00422114
   HwsConfigure::GetInstance();
 
   // now passing things off to fuse, fuse will finish evaluating the command line args
   fuse_res = fuse_main(custom_args.argc, custom_args.argv, &s3fs_oper, NULL);
+  if (fuse_res == 0){
+      fuse_res = s3fs_init_deferred_exit_status;
+  }
   fuse_opt_free_args(&custom_args);
 
+  // Destroy curl
+  if(!S3fsCurl::DestroyS3fsCurl()){
+      S3FS_PRN_WARN("Could not release curl library.");
+  }
+  // ssl
   s3fs_destroy_global_ssl();
 
   destroyDHTViewVersinoInfo();

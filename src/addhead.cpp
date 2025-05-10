@@ -23,6 +23,7 @@
 #include <string.h>
 #include <assert.h>
 #include <curl/curl.h>
+#include <limits.h>
 #include <sstream>
 #include <fstream>
 #include <string>
@@ -34,6 +35,7 @@
 #include "addhead.h"
 #include "curl.h"
 #include "s3fs.h"
+#include "hws_fs_util.h"
 
 using namespace std;
 
@@ -52,11 +54,8 @@ AdditionalHeader AdditionalHeader::singleton;
 //-------------------------------------------------------------------
 AdditionalHeader::AdditionalHeader()
 {
-  if(this == AdditionalHeader::get()){
-    is_enable = false;
-  }else{
-    assert(false);
-  }
+  is_enable = false;
+  assert(this == AdditionalHeader::get());
 }
 
 AdditionalHeader::~AdditionalHeader()
@@ -76,7 +75,12 @@ bool AdditionalHeader::Load(const char* file)
   }
   Unload();
 
-  ifstream AH(file);
+  char resolved_path[PATH_MAX];
+  if(!verifyPath(file, resolved_path, true)) {
+    return false;
+  }
+
+  ifstream AH(resolved_path);
   if(!AH.good()){
     S3FS_PRN_WARN("Could not open file(%s).", file);
     return false;

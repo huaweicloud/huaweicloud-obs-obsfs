@@ -1,3 +1,16 @@
+/*
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
 #ifndef _HWS_FD_CACHE_H_
 #define _HWS_FD_CACHE_H_
 #include "common.h"
@@ -128,16 +141,12 @@ struct HwsFdWritePage
           state_ = HWS_FD_WRITE_STATE_WAIT;
           crc_ = 0;
           refs_ = 0;
+          data_ = nullptr;
           thread_start = false;
           err_type_ = BUTT_ERR;
-          data_ = new(std::nothrow) char[write_page_size];
-          if (nullptr != data_)
-          {
-              thread_ = std::thread(thread_task_, this);
-              thread_start = true;
-          }
           clock_gettime(CLOCK_MONOTONIC_COARSE, &last_write_ts_);
     }
+
     ~HwsFdWritePage()
     {
         if (thread_start)
@@ -149,6 +158,8 @@ struct HwsFdWritePage
             delete[] data_;
         }
     }
+
+    int Init();
     size_t IntersectWriteMergeToLastpage(
             const char *buf,off64_t wrtOffset, size_t wrtSize);
     size_t Append(const char *buf,off64_t offset, size_t size,
@@ -156,7 +167,7 @@ struct HwsFdWritePage
     bool Full(){ return bytes_ >= write_page_size_||state_ > HWS_FD_WRITE_STATE_WAIT;}
     bool IsSequential(off64_t offset)
     {
-        off64_t write_end = offset_ + bytes_;
+        off64_t write_end = offset_ + (off64_t)(bytes_);
         return write_end == offset;
     }
     char* GetDataBuf()
@@ -210,7 +221,7 @@ class HwsFdWritePageList
     size_t Append(const char *path, const char *buf, off64_t offset, 
             size_t size,bool* pbIsSequential);
     int ReadLastOverLap(const char* path,
-        HwsWriteLastPageRead_S *readInfo, size_t offset, size_t readSize);
+        HwsWriteLastPageRead_S *readInfo, off64_t offset, size_t readSize);
     void Clean();
     unsigned int GetCurWrtPageNum();
     bool IsWritePageErr()
@@ -238,7 +249,7 @@ struct HwsFdReadPage
     std::vector<uint32_t> crc_;
     int      refs_;
     size_t   read_size_;   //data size in page
-    off64_t  hitSizeInPage;  
+    size_t  hitSizeInPage;
     struct timespec got_ts_;
     struct timespec last_hit_ts_;
     std::mutex& read_ahead_mutex_;    /*for read page list lock*/    
@@ -256,28 +267,27 @@ struct HwsFdReadPage
              read_ahead_mutex_(read_ahead_mutex),
              thread_task_(thread_task){
       state_ = HWS_FD_READ_STATE_RECVING;
-      data_ = new char[read_page_size];
       got_ts_ = {0, 0};
       last_hit_ts_ = {0, 0};
       refs_ = 0;
       read_size_ = 0;
       crc_.reserve(read_page_size/HWS_READ_CRC_SIZE);
       is_read_finish_ = false;
+      data_ = nullptr;
       hitSizeInPage = 0;
-      if (NULL != thread_task_)
-      {
-          thread_ = std::thread(thread_task_, this);
-      }
     }
+
     ~HwsFdReadPage(){
-        if (NULL != thread_task_)
+        if (NULL != thread_task_ && thread_.joinable())
         {
             thread_.join();
         }
         delete[] data_;
     }
+
+    int Init();
     void GenerateCrc(ssize_t read_size);
-    bool CheckCrcErr(size_t offset, size_t size);
+    bool CheckCrcErr(off64_t offset, size_t size);
     void ReadPageRef()
     {
         refs_++;
@@ -362,7 +372,7 @@ struct HwsFdReadWholeCacheStat
 {
     struct timespec first_ts;
     off64_t notHitTimes;
-    off64_t notHitSize;
+    size_t notHitSize;
 };
 
 struct HwsFdReadStat
@@ -384,6 +394,8 @@ class HwsFdReadStatVec
     HwsFdReadStatVec(int size)
     {
         stat_.reserve(size);
+        first_ts_ = {0,0};
+        last_ts_ = {0,0};
         isSequential_ = false;
         offset_ = 0;
         firstToLastDiffMs = 0;
@@ -432,7 +444,7 @@ class HwsFdEntity
         return fileSize_ == offset; 
     }
     void UpdateFileSize(off64_t offset, size_t size){
-        off64_t write_end = offset + size;
+        off64_t write_end = offset + (off64_t)(size);
         if(write_end > fileSize_)
         {
             fileSize_ = write_end;
@@ -469,8 +481,10 @@ class HwsFdEntity
         write_end_ = 0;
         sequential_modify_count_ = 0;
         wholeCachePage_.cacheHitCnt = 0;
+        wholeCachePage_.cacheEndTs = {0,0};
         wholeCacheWriteConflict_ = false;
         wholeCacheTaskStarted_ = false;
+        wholeCacheStat_.first_ts = {0,0};
         ClearWholeReadCacheStatis();
     }
     ~HwsFdEntity(){};
@@ -530,7 +544,7 @@ class HwsFdEntity
     void ChangeFilePathIfNeed(const char* path); /*in lock*/
     void UpdateFileSizeForTruncate(size_t size){ /*not in lock*/
         std::lock_guard<std::mutex> entity_lock(entity_mutex_);
-        fileSize_ = size;
+        fileSize_ = (off64_t)(size);
     }
 
     void ClearWholeReadCacheStatis()
@@ -588,6 +602,9 @@ class HwsFdManager
   public:
     HwsFdManager()
     {
+        cache_mem_size.store(0);
+        print_free_cache_ts_ = {0,0};
+        prev_check_cache_size_ts_ = {0,0};
         bDaemonStop = false;        
     }
     ~HwsFdManager()
@@ -646,6 +663,7 @@ class HwsCacheStatis
   public:
     HwsCacheStatis()
     {
+        memset(printStrBuf, 0, sizeof(printStrBuf));
         ClearStatis();
     }
     ~HwsCacheStatis(){}

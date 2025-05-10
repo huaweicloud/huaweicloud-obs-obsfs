@@ -199,7 +199,7 @@ string get_username(uid_t uid)
       maxlen = 0;
       return string("");
     }
-    maxlen = res;
+    maxlen = static_cast<size_t>(res);
   }
   if(NULL == (pbuf = (char*)malloc(sizeof(char) * maxlen))){
     S3FS_PRN_CRIT("failed to allocate memory.");
@@ -237,7 +237,7 @@ int is_uid_include_group(uid_t uid, gid_t gid)
       maxlen = 0;
       return -ERANGE;
     }
-    maxlen = res;
+    maxlen = static_cast<size_t>(res);
   }
   if(NULL == (pbuf = (char*)malloc(sizeof(char) * maxlen))){
     S3FS_PRN_CRIT("failed to allocate memory.");
@@ -896,13 +896,6 @@ void show_help (void)
     "   curldbg - put curl debug message\n"
     "        Put the debug message from libcurl when this option is specified.\n"
     "\n"
-    "   cipher_suites - customize TLS cipher suite list\n"
-    "        Customize the list of TLS cipher suites.\n"
-    "        Expects a colon separated list of cipher suite names.\n"
-    "        A list of available cipher suites, depending on your TLS engine,\n"
-    "        can be found on the CURL library documentation:\n"
-    "        https://curl.haxx.se/docs/ssl-ciphers.html\n"
-    "\n"
     "   complement_stat (complement lack of file/directory mode)\n"
     "        obsfs complements lack of information about file/directory mode\n"
     "        if a file or a directory object does not have x-amz-meta-mode\n"
@@ -943,14 +936,13 @@ void show_help (void)
     "\n"
     " -h, --help        Output this help.\n"
     "     --version     Output version info.\n"
+    " -c  --config      Set AK SK.\n"
     " -d  --debug       Turn on DEBUG messages to syslog. Specifying -d\n"
     "                   twice turns on FUSE debug messages to STDOUT.\n"
     " -f                FUSE foreground option - do not run as daemon.\n"
     " -s                FUSE singlethreaded option\n"
     "                   disable multi-threaded operation\n"
     "\n"
-    "\n"
-    "obsfs home page: <https://github.com/obsfs-fuse/obsfs-fuse>\n"
   );
   return;
 }

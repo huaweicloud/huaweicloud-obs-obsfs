@@ -254,10 +254,10 @@ bool StatCache::GetStat(string& key, struct stat* pst, headers_t* meta, bool ove
       string stretag;
       if(petag){
         // find & check ETag
-        for(headers_t::iterator iter = ent->meta.begin(); iter != ent->meta.end(); ++iter){
-          string tag = lower(iter->first);
+        for(headers_t::iterator it = ent->meta.begin(); it != ent->meta.end(); ++it){
+          string tag = lower(it->first);
           if(tag == "etag"){
-            stretag = iter->second;
+            stretag = it->second;
             if('\0' != petag[0] && 0 != strcmp(petag, stretag.c_str())){
               is_delete_cache = true;
             }

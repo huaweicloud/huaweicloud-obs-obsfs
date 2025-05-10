@@ -1,3 +1,16 @@
+/*
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
 #include <string.h>
 #include <assert.h>
 #include <time.h>
@@ -36,199 +49,267 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
     {
         HWS_CFG_DEBUG_LOG_MODE,
         "dbglogmode",
-        HWS_CONFIG_INVALID_VALUE
+        HWS_CONFIG_INVALID_VALUE,
+        0,
+        2
     },
     {
         HWS_CFG_STAT_PRINT_SECONDS,
         "statisprintseconds",
-        180
+        180,
+        1,
+        1800
     },
     {
         HWS_CFG_STAT_PRINT_COUNT,
         "statisprintcount",
-        5000
+        5000,
+        1,
+        100000
     },
     {
         HWS_CFG_FUSE_INTF_LOG_LEVEL,
         "fuse_intf_log_level",
-        7
+        7,
+        0,
+        15
     },
     {
         HWS_CFG_DATA_CACHE_LOG_LEVEL,
         "obsfs_data_cache_log_level",
-        7
+        7,
+        0,
+        15
     },
     {
         HWS_CFG_CACHE_ASSERT,
         "cacheassert",
-        0
+        0,
+        0,
+        1
     },
     {
         HWS_CFG_COULDNT_RESOLVE_HOST,
         "can_not_resolve_host_retrycnt",
-        10
+        10,
+        1,
+        100
     },
     {
         HWS_CFG_MAX_PRINT_LOG_NUM_PERIOD,
         "max_print_log_num_period",
-        3
+        3,
+        1,
+        30
     },    
     {
         HWS_CFG_STATIS_OPER_LONG_MS,
         "statis_operate_long_ms",
-        1000
+        1000,
+        100,
+        10000
     },    
 
     //2,cache cfg para    
     {
         HWS_CFG_CACHE_CHECK_CRC_OPEN,
         "cache_check_crc_open",
-        0
+        0,
+        0,
+        1
     },   
     //default cache attr switch close
     {
         HWS_CFG_CACHE_ATTR_SWITCH_OPEN,
         "cache_attr_switch_open",
-        0
+        0,
+        0,
+        1
     },
     //default cache attr valid is 2 hour
     {
         HWS_CFG_CACHE_ATTR_VALID_MS,
         "cache_attr_valid_ms",
-        7200000
+        7200000,
+        0,
+        86400000
     },
     //default list cache attr valid is 5s
     {
         HWS_CFG_CACHE_ATTR_VALID_4_LIST_MS,
         "list_cache_attr_valid_ms",
-        5000
+        5000,
+        0,
+        3600000
     },
     //default meta cache capacity is 20000
     {
         HWS_CFG_META_CACHE_CAPACITY,
         "meta_cache_capacity",
-        20000
+        20000,
+        20000,
+        1000000
     }
     ,
     //read page clean after 3 second
     {
         HWS_CFG_READ_PAGE_CLEAN_MS,
         "read_page_clean_ms",
-        3000
+        3000,
+        0,
+        3600000
     },
     //gMaxCacheMemSize(MB)
     {
         HWS_CFG_MAX_CACHE_MEM_SIZE_MB,
         "max_cache_mem_size_mb",
-        1024
+        1024,
+        128,
+        1048576
     },
     //gReadStatDiffLongMs(ms)
     {
         HWS_READ_AHEAD_STAT_DIFF_LONG,
         "read_ahead_stat_diff_long_ms",
-        50000
+        50000,
+        0,
+        3600000
     },
     //gReadStatDiffShortMs(ms),one read 0.2s,24 read need 4.8s,must larger than 4.8s
     {
         HWS_READ_AHEAD_STAT_DIFF_SHORT,
         "read_ahead_stat_diff_short_ms",
-        10000
+        10000,
+        0,
+        3600000
     },   
     //gFreeCacheThresholdPercent,if lower,use gReadStatDiffShortMs
     {
         HWS_FREE_CACHE_THRESHOLD_PERCENT,
         "free_cache_threshold_percent",
-        20
+        20,
+        1,
+        99
     },   
     //gReadStatVecSize
     {
         HWS_READ_STAT_VEC_SIZE,
         "read_stat_vec_size",
+        32,
+        2,
         32
     },
     //gReadStatSequentialSize
     {
         HWS_READ_STAT_SEQUENTIAL_SIZE,
         "read_stat_sequential_size",
-        24
+        24,
+        2,
+        32
     },    
     //gReadStatSizeThreshold,default 4MB
     {
         HWS_READ_STAT_SIZE_THRESHOLD,
         "read_stat_size_threshold",
-        4194304
+        4194304,
+        4096,
+        20971520
     },    
     //g_bIntersectWriteMerge,if merge intersect write to write cache
     {
         HWS_INTERSECT_WRITE_MERGE,
         "intersect_write_merge",
-        0
+        0,
+        0,
+        1
     },
     //gReadPageNum
     {
         HWS_READ_PAGE_NUM,
         "read_page_num",
-        12
+        12,
+        1,
+        1024
     },
     //gWritePageNum
     {
         HWS_WRITE_PAGE_NUM,
         "write_page_num",
-        12
+        12,
+        1,
+        1024
     },
     //g_wholeFileCacheSwitch
     {
         HWS_WHOLE_CACHE_SWITCH,
         "whole_cache_switch",
-        0
+        0,
+        0,
+        1
     },
     //g_wholeFileCacheMaxMemSize(GB)
     {
         HWS_WHOLE_CACHE_MAX_MEM_SIZE,
         "whole_cache_max_mem_gb",
-        10
+        10,
+        0,
+        32
     },
     //g_wholeFileCachePreReadStatisPeriod(seconds)
     {
         HWS_WHOLE_CACHE_STATIS_PERIOD,
         "whole_cache_statis_period_second",
-        5
+        5,
+        0,
+        3600
     },
     //g_wholeFileCacheNotHitTimesPerPeriod
     {
         HWS_WHOLE_CACHE_READ_TIMES,
         "whole_cache_not_hit_times",
-        300
+        300,
+        1,
+        3000
     },
     //g_wholeFileCacheNotHitSizePerPeriod(MB)
     {
         HWS_WHOLE_CACHE_READ_SIZE,
         "whole_cache_not_hit_size_mb",
-        5
+        5,
+        1,
+        100
     },
     //g_wholeFileCachePreReadInterval(ms)
     {
         HWS_WHOLE_CACHE_READ_INTERVAL_MS,
         "whole_cache_pre_read_interval_ms",
-        50
+        50,
+        1,
+        60000
     },
     //g_wholeFileCacheMaxRecycleTime(seconds)
     {
         HWS_WHOLE_CACHE_MAX_RECYCLE_TIME,
         "whole_cache_recycle_time_second",
-        10800
+        10800,
+        30,
+        86400
     },
     //g_wholeFileCacheMaxHitTimes
     {
         HWS_WHOLE_CACHE_MAX_HIT_TIMES,
         "whole_cache_max_hit_times_thousand",
-        500
+        500,
+        10,
+        10000
     },
     //g_MinReadWritePageByCacheSize
     {
         HWS_MIN_READ_WRITE_PAGE_BY_CACHE_SIZE,
         "min_read_write_page_by_cache_size",
-        0
+        0,
+        0,
+        10
     },
 
     //3. other paras
@@ -236,19 +317,25 @@ HwsConfigIntItem_s  g_hwsConfigIntTable[] =
     {
         HWS_REQUEST_WITH_INODENO,
         "request_with_inodeno",
+        1,
+        0,
         1
     },    
     //period check ak sk change
     {
         HWS_PERIOD_CHECK_AK_SK_CHANGE,
         "period_check_ak_sk_change",
+        1,
+        0,
         1
     },    
     //g_listMaxKey
     {
         HWS_LIST_MAX_KEY,
         "list_max_key",
-        110
+        110,
+        1,
+        1000
     }
 };
 
@@ -257,7 +344,9 @@ HwsConfigStrItem_s  g_hwsConfigStrTable[] =
     {
         HWS_CFG_DEBUG_LEVEL,
         "dbglevel",
-        ""                /*default empty str*/
+        "",                /*default empty str*/
+        3,
+        11
     }
     
 };
@@ -293,6 +382,13 @@ void HwsConfigure::getIntByParamName(std::string& line,HwsConfigIntItem_s* pConf
     {
         strParamValue = line.substr(line.find_last_of("=") + 1);
         intValue = atoi(strParamValue.c_str());
+
+        if (intValue < pConfigItem->minValue || intValue > pConfigItem->maxValue) {
+            S3FS_PRN_ERR("config value out of range, %s should be between %d and %d",
+                         pConfigItem->paramName, pConfigItem->minValue, pConfigItem->maxValue);
+            return;
+        }
+
         S3FS_PRN_INFO("line: %s, strParamValue=%s,intValue=%d", 
             line.c_str(), strParamValue.c_str(),intValue); 
     }
@@ -315,6 +411,11 @@ void HwsConfigure::getStrByParamName(std::string& line,HwsConfigStrItem_s* pConf
     if (std::string::npos != line.find_last_of("="))
     {
         std::string valString = line.substr(line.find_last_of("=") + 1);
+        if(valString.size() < pConfigItem->minLen || valString.size() > pConfigItem->maxLen) {
+            S3FS_PRN_ERR("config length of %s must be between %d and %d",
+                         pConfigItem->paramName, pConfigItem->minLen, pConfigItem->maxLen);
+            return;
+        }
         strncpy(pConfigItem->strValue,valString.c_str(),HWS_CONFIG_VALUE_STR_LEN-1);
         
         S3FS_PRN_INFO("line: %s, strParamValue=%s", 
@@ -413,7 +514,7 @@ void HwsConfigure::hwsAnalyseConfigLine_Int(std::string& line)
 
 void HwsConfigure::hwsAnalyseConfigFile(bool analyseIntParam)
 {   
-    std::fstream fp(g_logConfigurePath);
+    std::ifstream fp(g_logConfigurePath);
     if (false == fp.is_open())
     {
         S3FS_PRN_DBG("open obsfsconfig failed");

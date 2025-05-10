@@ -41,6 +41,7 @@
 //
 // Macro
 //
+#define S3FS "obsfs"
 static inline const char *SAFESTRPTR(const char *strptr) { return strptr ? strptr : ""; }
 
 typedef enum
@@ -241,7 +242,6 @@ extern const char*    s3fs_log_nest[S3FS_LOG_NEST_MAX];
 
 /* file gateway modify begin */
 extern const char*    hws_s3fs_client;
-extern const char*    hws_s3fs_req_objname_use_path;
 extern const char*    hws_s3fs_inodeNo;
 extern const char*    hws_s3fs_shardkey;
 extern const char*    hws_s3fs_connection;

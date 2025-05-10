@@ -1,21 +1,14 @@
 /*
- * s3fs - FUSE-based file system backed by Amazon S3
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
  *
- * Copyright(C) 2007 Randy Rizun <rrizun@gmail.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
  *
  * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
 #ifndef HWS_INDEX_CACHE_H_
@@ -24,6 +17,7 @@
 #include "snas_list.h"
 #include <assert.h>
 #include <time.h>
+#include <mutex>
 
 using namespace std;
 
@@ -57,14 +51,11 @@ private:
         {
             SNAS_ListAdd(&(entries_+i)->list_ptr, &lru_head);
         }
-
-        pthread_spin_init(&index_cache_lock, PTHREAD_PROCESS_PRIVATE);
     }
 
     ~IndexCache()
     {
         delete[] entries_;
-        pthread_spin_destroy(&(index_cache_lock));
     }
 
 public:
@@ -78,12 +69,13 @@ public:
     int setFirstWriteFlag(string key);
     void ReplaceIndex(string srcKey, string destKey, tag_index_cache_entry_t* p_index_cache_entry);
     int setFilesizeOrClearGetAttrStat(string path,
-            off64_t cacheFileSize,bool clearGetAttrStat);
+            off64_t cacheFileSize,bool clearGetAttrStat, CACHE_STAT_TYPE statType = STAT_TYPE_BUTT);
+    int setFilesizeAndClearIndexCacheTime(string path, off64_t cacheFileSize);
     void AddEntryOpenCnt(string path);
     void resizeMetaCacheCapacity(size_t capacity);
 
 private:
-
+    Node* getnodeInlock(string &key);
     void operateOpenCnt(Node *node, tag_open_cnt_use_type openCntType);
     void putNodeToList(Node *node, string key);
     int putIndexInternal(string key, tag_index_cache_entry_t *data, tag_open_cnt_use_type openCntType);
@@ -97,7 +89,7 @@ private:
     SNAS_ListHead    lru_head;
     SNAS_ListHead    openflag_head;
 
-    pthread_spinlock_t index_cache_lock;
+    std::mutex index_cache_mutex;
     static IndexCache  singleton;
 };
 

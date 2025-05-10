@@ -21,6 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <libxml/parser.h>
+#include <libxml/tree.h>
 
 #include <sstream>
 #include <string>
@@ -204,6 +206,18 @@ string urlDecode(const string& s)
   return result;
 }
 
+//do special decode for "+"(space)
+std::string urlDecodeSpecial(std::string str) {
+    // replace "+"(space) to "%20" before decode
+    // truly "+" is already encode to "%2B" in str
+    size_t pos;
+    while ((pos = str.find("+")) != std::string::npos) {
+        str.replace(pos, 1, "%20");
+    }
+    str = urlDecode(str);
+    return str;
+}
+
 bool takeout_str_dquart(string& str)
 {
   size_t pos;
@@ -258,7 +272,8 @@ string get_date_rfc850()
 {
   char buf[100];
   time_t t = time(NULL);
-  strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&t));
+  struct tm res;
+  strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", gmtime_r(&t, &res));
   return buf;
 }
 
@@ -272,14 +287,16 @@ void get_date_sigv3(string& date, string& date8601)
 string get_date_string(time_t tm)
 {
   char buf[100];
-  strftime(buf, sizeof(buf), "%Y%m%d", gmtime(&tm));
+  struct tm res;
+  strftime(buf, sizeof(buf), "%Y%m%d", gmtime_r(&tm, &res));
   return buf;
 }
 
 string get_date_iso8601(time_t tm)
 {
   char buf[100];
-  strftime(buf, sizeof(buf), "%Y%m%dT%H%M%SZ", gmtime(&tm));
+  struct tm res;
+  strftime(buf, sizeof(buf), "%Y%m%dT%H%M%SZ", gmtime_r(&tm, &res));
   return buf;
 }
 
@@ -379,6 +396,55 @@ unsigned char* s3fs_decode64(const char* input, size_t* plength)
   result[wpos] = '\0';
   *plength = wpos;
   return result;
+}
+
+void getMessage(xmlNode * a_node, char **message){
+    xmlNode *cur_node = NULL;
+    char *xmlMessage = NULL;
+    for (cur_node = a_node;  cur_node; cur_node = cur_node->next) {
+        if (cur_node->type == XML_ELEMENT_NODE && xmlStrcmp(cur_node->name, (const xmlChar *)"Message") == 0){
+            xmlMessage = (char *)xmlNodeGetContent(cur_node);
+            if (xmlMessage != NULL) {
+                *message = (char *)malloc(strlen(xmlMessage) + 1);
+                if (*message == NULL){
+                    S3FS_PRN_ERR("obsfs: malloc string buffer fail.")
+                    xmlFree(xmlMessage);
+                    return;
+                }
+                memcpy(*message, xmlMessage, strlen(xmlMessage)+1);
+                xmlFree(xmlMessage);
+            }else{
+                *message = (char *)malloc(1);
+                if (*message == NULL){
+                    S3FS_PRN_ERR("obsfs: malloc string buffer fail.")
+                    return;
+                }
+                *message[0] = '\0';
+            }
+            return;
+        }
+        getMessage(cur_node->children, message);
+        if (*message != NULL) {
+            return;
+        }
+    }
+}
+
+void getMessageFromBodydata(const char *bodydata, char **message){
+    xmlDoc *doc = NULL;
+    xmlNode *root_element = NULL;
+    if (bodydata == NULL || strcmp(bodydata, "") == 0){
+        return;
+    }
+    doc = xmlParseDoc((const xmlChar *)bodydata);
+    if (doc == NULL) {
+        S3FS_PRN_ERR("error: could not parse string %s\n", bodydata);
+        return;
+    }
+    root_element = xmlDocGetRootElement(doc);
+    getMessage(root_element, message);
+    xmlFreeDoc(doc);
+    xmlCleanupParser();
 }
 
 /*

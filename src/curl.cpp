@@ -33,6 +33,7 @@
 #include <libxml/xpath.h>
 #include <libxml/xpathInternals.h>
 #include <libxml/tree.h>
+#include <limits.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -49,6 +50,8 @@
 #include "s3fs_util.h"
 #include "s3fs_auth.h"
 #include "addhead.h"
+#include "hws_fs_util.h"
+#include "hws_cipher_key_check.h"
 
 /* file gateway modify begin */
 #include "hws_s3fs_statis_api.h"
@@ -110,21 +113,21 @@ static string url_to_host(const std::string &url)
 
   static const string http = "http://";
   static const string https = "https://";
-  std::string host;
+  std::string hostName;
 
   if (url.compare(0, http.size(), http) == 0) {
-    host = url.substr(http.size());
+    hostName = url.substr(http.size());
   } else if (url.compare(0, https.size(), https) == 0) {
-    host = url.substr(https.size());
+    hostName = url.substr(https.size());
   } else {
     assert(!"url does not begin with http:// or https://");
   }
 
   size_t idx;
-  if ((idx = host.find('/')) != string::npos) {
-    return host.substr(0, idx);
+  if ((idx = hostName.find('/')) != string::npos) {
+    return hostName.substr(0, idx);
   } else {
-    return host;
+    return hostName;
   }
 }
 
@@ -337,6 +340,11 @@ void CurlHandlerPool::ReturnHandler(CURL* h)
   }
 }
 
+int CurlHandlerPool::GetActiveCurlNum()
+{
+  return mMaxHandlers - mIndex;
+}
+
 //-------------------------------------------------------------------
 // Class S3fsCurl
 //-------------------------------------------------------------------
@@ -373,7 +381,7 @@ bool             S3fsCurl::is_cert_check       = true; // default
 bool             S3fsCurl::is_dns_cache        = true; // default
 bool             S3fsCurl::is_ssl_session_cache= true; // default
 long             S3fsCurl::connect_timeout     = 300;  // default
-time_t           S3fsCurl::readwrite_timeout   = 60;   // default
+time_t           S3fsCurl::readwrite_timeout   = 45;   // default
 /* file gateway modify begin */
 int              S3fsCurl::retries             = 3;    // default
 /* file gateway modify end */
@@ -653,8 +661,13 @@ bool S3fsCurl::InitMimeType(const char* MimeFile)
     MimeFile = "/etc/mime.types";  // default
   }
 
+  char resolved_path[PATH_MAX];
+  if(!verifyPath(MimeFile, resolved_path, false)) {
+    return false;
+  }
+
   string line;
-  ifstream MT(MimeFile);
+  ifstream MT(resolved_path);
   if(MT.good()){
     while(getline(MT, line)){
       if(line[0]=='#'){
@@ -683,7 +696,7 @@ bool S3fsCurl::InitMimeType(const char* MimeFile)
 void S3fsCurl::InitUserAgent(void)
 {
   if(S3fsCurl::userAgent.empty()){
-    S3fsCurl::userAgent =  "s3fs/";
+    S3fsCurl::userAgent =  "" S3FS"/";
     S3fsCurl::userAgent += VERSION;
     S3fsCurl::userAgent += " (commit hash ";
     S3fsCurl::userAgent += COMMIT_HASH_VAL;
@@ -762,7 +775,11 @@ bool S3fsCurl::LocateBundle(void)
     CURL_CA_BUNDLE = getenv("CURL_CA_BUNDLE");
     if(CURL_CA_BUNDLE != NULL)  {
       // check for existence and readability of the file
-      ifstream BF(CURL_CA_BUNDLE);
+      char resolved_path[PATH_MAX];
+      if(!verifyPath(CURL_CA_BUNDLE, resolved_path, true)) {
+        return false;
+      }
+      ifstream BF(resolved_path);
       if(!BF.good()){
         S3FS_PRN_ERR("%s: file specified by CURL_CA_BUNDLE environment variable is not readable", program_name.c_str());
         return false;
@@ -833,7 +850,6 @@ size_t S3fsCurl::WriteMemoryCallback(void* ptr, size_t blockSize, size_t numBloc
   if(!body->Append(ptr, blockSize, numBlocks)){
     S3FS_PRN_CRIT("BodyData.Append() returned false.");
     S3FS_FUSE_EXIT();
-    return -1;
   }
   return (blockSize * numBlocks);
 }
@@ -848,7 +864,7 @@ size_t S3fsCurl::ReadUploadCache(void* ptr, size_t blockSize, size_t numBlocks, 
 
     if ((NULL == ptr) || (NULL == data))
     {
-        S3FS_PRN_ERR("Null pointer exception buffer=%p, userp=%p", ptr, data);
+        S3FS_PRN_ERR("Null pointer exception");
         return 0;
     }
 
@@ -859,7 +875,7 @@ size_t S3fsCurl::ReadUploadCache(void* ptr, size_t blockSize, size_t numBlocks, 
         return 0;
     }
 
-    userBufferRemainSize = databuff->ulBufferSize - databuff->offset;
+    userBufferRemainSize = (long long)(databuff->ulBufferSize) - databuff->offset;
     setBufferSize = blockSize * numBlocks;
 
     S3FS_PRN_DBG("CurlRest: User bufferize:%lu,  RemainSize:%d, curl buffersize:%lu", databuff->ulBufferSize, userBufferRemainSize, setBufferSize);
@@ -889,7 +905,7 @@ size_t S3fsCurl::ReadUploadCache(void* ptr, size_t blockSize, size_t numBlocks, 
         else
         {
             memcpy(ptr,  databuff->pcBuffer + databuff->offset, setBufferSize);
-            databuff->offset+= setBufferSize;
+            databuff->offset+= (off_t)(setBufferSize);
             S3FS_PRN_DBG("CurlRest: Curl buffer less, the new user buffer index is %ld.", databuff->offset);
 
             return setBufferSize;
@@ -909,7 +925,7 @@ size_t S3fsCurl::ReadCallback(void* ptr, size_t size, size_t nmemb, void* userp)
   if(0 >= pCurl->postdata_remaining){
     return 0;
   }
-  int copysize = std::min((int)(size * nmemb), pCurl->postdata_remaining);
+  unsigned int copysize = std::min((unsigned int)(size * nmemb), pCurl->postdata_remaining);
   memcpy(ptr, pCurl->postdata, copysize);
 
   pCurl->postdata_remaining = (pCurl->postdata_remaining > copysize ? (pCurl->postdata_remaining - copysize) : 0);
@@ -950,7 +966,7 @@ size_t S3fsCurl::UploadReadCallback(void* ptr, size_t size, size_t nmemb, void* 
     return 0;
   }
   // read size
-  ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
+  ssize_t copysize = (ssize_t)((size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size);
   ssize_t readbytes;
   ssize_t totalread;
   // read and set
@@ -983,7 +999,7 @@ size_t S3fsCurl::DownloadWriteCallback(void* ptr, size_t size, size_t nmemb, voi
   }
 
   // write size
-  ssize_t copysize = (size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size;
+  ssize_t copysize = (ssize_t)((size * nmemb) < (size_t)pCurl->partdata.size ? (size * nmemb) : (size_t)pCurl->partdata.size);
   ssize_t writebytes;
   ssize_t totalwrite;
 
@@ -1097,10 +1113,10 @@ string S3fsCurl::GetDefaultAcl()
   return S3fsCurl::default_acl;
 }
 
-storage_class_t S3fsCurl::SetStorageClass(storage_class_t storage_class)
+storage_class_t S3fsCurl::SetStorageClass(storage_class_t storageClass)
 {
   storage_class_t old = S3fsCurl::storage_class;
-  S3fsCurl::storage_class = storage_class;
+  S3fsCurl::storage_class = storageClass;
   return old;
 }
 
@@ -1116,7 +1132,6 @@ bool S3fsCurl::PushbackSseKeys(string& onekey)
   // make base64
   char* pbase64_key;
   if(NULL == (pbase64_key = s3fs_base64((unsigned char*)onekey.c_str(), onekey.length()))){
-    S3FS_PRN_ERR("Failed to convert base64 from SSE-C key %s", onekey.c_str());
     return false;
   }
   string base64_key = pbase64_key;
@@ -1125,7 +1140,6 @@ bool S3fsCurl::PushbackSseKeys(string& onekey)
   // make MD5
   string strMd5;
   if(!make_md5_from_string(onekey.c_str(), strMd5)){
-    S3FS_PRN_ERR("Could not make MD5 from SSE-C keys(%s).", onekey.c_str());
     return false;
   }
   // mapped MD5 = SSE Key
@@ -1161,7 +1175,11 @@ bool S3fsCurl::SetSseCKeys(const char* filepath)
 
   S3fsCurl::sseckeys.clear();
 
-  ifstream ssefs(filepath);
+  char resolved_path[PATH_MAX];
+  if(!verifyPath(filepath, resolved_path, true)) {
+    return false;
+  }
+  ifstream ssefs(resolved_path);
   if(!ssefs.good()){
     S3FS_PRN_ERR("Could not open SSE-C keys file(%s).", filepath);
     return false;
@@ -1302,29 +1320,39 @@ bool S3fsCurl::SetVerbose(bool flag)
   return old;
 }
 
-bool S3fsCurl::GetAccessKey(std::string&AccessKeyId, std::string&SecretAccessKey)
-{
-  if((AWSAccessKeyId !="" && AWSSecretAccessKey =="") || (AWSAccessKeyId =="" && AWSSecretAccessKey !="" )){
-    S3FS_PRN_ERR("AWSAccesskey or AWSSecretkey is not specified.");
-    return false;
-  }
-  pthread_rwlock_rdlock(&S3fsCurl::curl_aksk_rwlock);
-  AccessKeyId     = AWSAccessKeyId;
-  SecretAccessKey = AWSSecretAccessKey;
-  pthread_rwlock_unlock(&S3fsCurl::curl_aksk_rwlock);
-  return true;
-}
-
 bool S3fsCurl::SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey)
 {
-  if((!S3fsCurl::is_ibm_iam_auth && (!AccessKeyId || '\0' == AccessKeyId[0])) || !SecretAccessKey || '\0' == SecretAccessKey[0]){
-    return false;
-  }
-  pthread_rwlock_wrlock(&S3fsCurl::curl_aksk_rwlock);
-  AWSAccessKeyId     = AccessKeyId;
-  AWSSecretAccessKey = SecretAccessKey;
-  pthread_rwlock_unlock(&S3fsCurl::curl_aksk_rwlock);
-  return true;
+  return SetAccessKeyAndToken(AccessKeyId, SecretAccessKey, "");
+}
+
+bool S3fsCurl::GetAccessKeyAndToken(std::string&AccessKeyId, std::string&SecretAccessKey,std::string&AccessToken)
+{
+    if((AWSAccessKeyId !="" && AWSSecretAccessKey =="") || (AWSAccessKeyId =="" && AWSSecretAccessKey !="" )){
+        S3FS_PRN_ERR("AWSAccesskey or AWSSecretkey is not specified.");
+        return false;
+    }
+    pthread_rwlock_rdlock(&S3fsCurl::curl_aksk_rwlock);
+    AccessKeyId     = AWSAccessKeyId;
+    SecretAccessKey = AWSSecretAccessKey;
+    AccessToken = AWSAccessToken;
+    pthread_rwlock_unlock(&S3fsCurl::curl_aksk_rwlock);
+    return true;
+}
+
+bool S3fsCurl::SetAccessKeyAndToken(const char* AccessKeyId, const char* SecretAccessKey,const char* AccessToken)
+{
+    if((!S3fsCurl::is_ibm_iam_auth
+    && (!AccessKeyId || '\0' == AccessKeyId[0]))
+    || !SecretAccessKey || '\0' == SecretAccessKey[0]
+    || !AccessToken){
+        return false;
+    }
+    pthread_rwlock_wrlock(&S3fsCurl::curl_aksk_rwlock);
+    AWSAccessKeyId     = AccessKeyId;
+    AWSSecretAccessKey = SecretAccessKey;
+    AWSAccessToken = AccessToken;
+    pthread_rwlock_unlock(&S3fsCurl::curl_aksk_rwlock);
+    return true;
 }
 
 long S3fsCurl::SetSslVerifyHostname(long value)
@@ -1574,9 +1602,9 @@ int S3fsCurl::ParallelGetObjectRequest(const char* tpath, int fd, off_t start, s
 {
   S3FS_PRN_INFO3("[tpath=%s][fd=%d]", SAFESTRPTR(tpath), fd);
 
-  sse_type_t ssetype;
+  sse_type_t sseType;
   string     ssevalue;
-  if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+  if(!get_object_sse_type(tpath, sseType, ssevalue)){
     S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
   }
   int        result = 0;
@@ -1599,7 +1627,7 @@ int S3fsCurl::ParallelGetObjectRequest(const char* tpath, int fd, off_t start, s
 
       // s3fscurl sub object
       S3fsCurl* s3fscurl_para = new S3fsCurl();
-      if(0 != (result = s3fscurl_para->PreGetObjectRequest(tpath, fd, (start + size - remaining_bytes), chunk, ssetype, ssevalue))){
+      if(0 != (result = s3fscurl_para->PreGetObjectRequest(tpath, fd, (start + size - remaining_bytes), chunk, sseType, ssevalue))){
         S3FS_PRN_ERR("failed downloading part setup(%d)", result);
         delete s3fscurl_para;
         return result;
@@ -1682,8 +1710,6 @@ bool S3fsCurl::ParseIAMCredentialResponse(const char* response, iamcredmap_t& ke
 
 bool S3fsCurl::SetIAMCredentials(const char* response)
 {
-  S3FS_PRN_INFO3("IAM credential response = \"%s\"", response);
-
   iamcredmap_t keyval;
 
   if(!ParseIAMCredentialResponse(response, keyval)){
@@ -1838,6 +1864,10 @@ S3fsCurl::S3fsCurl(bool ahbe) :
     writedatabuf.pcBuffer     = NULL;
     writedatabuf.ulBufferSize = 0;
     writedatabuf.offset       = 0;
+    read_buf                  = NULL;
+    read_startpos             = 0;
+    read_size                 = 0;
+    cur_pos                   = 0;
 /* file gateway modify end */
 }
 
@@ -2123,7 +2153,7 @@ bool S3fsCurl::RemakeHandle(void)
       // responseHeaders
       curl_easy_setopt(hCurl, CURLOPT_HEADERDATA, (void*)&responseHeaders);
       curl_easy_setopt(hCurl, CURLOPT_HEADERFUNCTION, HeaderCallback);
-      if (NULL != read_buf && read_size >= 0){
+      if (NULL != read_buf){
           if (cur_pos > 0){
               S3FS_PRN_WARN("### GET err, cur_pos: %ld, url: %s", cur_pos, url.c_str());
           }
@@ -2309,6 +2339,17 @@ int S3fsCurl::RequestPerform(void)
     s3fsStatisStart(LIB_CUR_SEND, &begin_tv);
     CURLcode curlCode = Hws_curl_easy_perform();
     s3fsStatisEnd(LIB_CUR_SEND, &begin_tv);
+
+    // print current curl pool status 
+    timeval end_tv;
+    gettimeofday(&end_tv, NULL);
+    unsigned long long diff_in_us = (unsigned long long)((US_PER_SECOND * (end_tv.tv_sec - begin_tv.tv_sec) +
+        end_tv.tv_usec - begin_tv.tv_usec));
+    if (diff_in_us > LONG_RESPONSE_TIME_US) {
+        S3FS_PRN_WARN("response time over %d us, time=%llu us, current active curl handle: %d,",
+            LONG_RESPONSE_TIME_US, diff_in_us, sCurlPool->GetActiveCurlNum());
+    }
+
 /* file gateway modify end */
     // Check result
     switch(curlCode){
@@ -2365,7 +2406,6 @@ int S3fsCurl::RequestPerform(void)
             return -EIO;
           }
 		}
-        break;
 
       case CURLE_WRITE_ERROR:
         S3FS_PRN_ERR("### CURLE_WRITE_ERROR, url: %s", url.c_str());
@@ -2446,7 +2486,6 @@ int S3fsCurl::RequestPerform(void)
         }
         S3FS_PRN_ERR("curlCode: %d  msg: %s, url: %s", curlCode, curl_easy_strerror(curlCode), url.c_str());
         return -EIO;
-        break;
 
 #ifdef CURLE_PEER_FAILED_VERIFICATION
       case CURLE_PEER_FAILED_VERIFICATION:
@@ -2488,7 +2527,6 @@ int S3fsCurl::RequestPerform(void)
       default:
         S3FS_PRN_ERR("###curlCode: %d  msg: %s", curlCode, curl_easy_strerror(curlCode));
         return -EIO;
-        break;
     }
     S3FS_PRN_INFO("### retrying..., url: %s", url.c_str());
 
@@ -2512,13 +2550,15 @@ int S3fsCurl::RequestPerform(void)
 // @param date e.g., get_date_rfc850()
 // @param resource e.g., "/pub"
 //
-string S3fsCurl::CalcSignatureV2(const string& method, const string& strMD5, const string& content_type, const string& date, const string& resource)
+string S3fsCurl::CalcSignatureV2(const string& method, const string& strMD5, const string& content_type, const string& date, const string& resource, const std::string& sk, const std::string& token)
 {
+  string secretAccessKey = !sk.empty() ? sk : AWSSecretAccessKey;
+  string accessToken = !token.empty() ? token : AWSAccessToken;
   string Signature;
   string StringToSign;
 
-  if(0 < S3fsCurl::IAM_role.size() || S3fsCurl::is_ecs){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-amz-security-token", S3fsCurl::AWSAccessToken.c_str());
+  if(!accessToken.empty()){
+    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-amz-security-token", accessToken.c_str());
   }
 
   StringToSign += method + "\n";
@@ -2528,10 +2568,10 @@ string S3fsCurl::CalcSignatureV2(const string& method, const string& strMD5, con
   StringToSign += get_canonical_headers(requestHeaders, true);
   StringToSign += resource;
 
-  const void* key            = S3fsCurl::AWSSecretAccessKey.data();
-  int key_len                = S3fsCurl::AWSSecretAccessKey.size();
+  const void* key            = secretAccessKey.data();
+  size_t key_len                = secretAccessKey.size();
   const unsigned char* sdata = reinterpret_cast<const unsigned char*>(StringToSign.data());
-  int sdata_len              = StringToSign.size();
+  size_t sdata_len              = StringToSign.size();
   unsigned char* md          = NULL;
   unsigned int md_len        = 0;;
 
@@ -2550,13 +2590,15 @@ string S3fsCurl::CalcSignatureV2(const string& method, const string& strMD5, con
   return Signature;
 }
 
-string S3fsCurl::CalcSignature(const string& method, const string& canonical_uri, const string& query_string, const string& strdate, const string& payload_hash, const string& date8601)
+string S3fsCurl::CalcSignature(const string& method, const string& canonical_uri, const string& query, const string& strdate, const string& payload_hash, const string& date8601, const std::string& sk, const std::string& token)
 {
+  string secretAccessKey = !sk.empty() ? sk : AWSSecretAccessKey;
+  string accessToken = !token.empty() ? token : AWSAccessToken;
   string Signature, StringCQ, StringToSign;
   string uriencode;
 
-  if(0 < S3fsCurl::IAM_role.size()  || S3fsCurl::is_ecs){
-    requestHeaders = curl_slist_sort_insert(requestHeaders, "x-amz-security-token", S3fsCurl::AWSAccessToken.c_str());
+  if(!accessToken.empty()){
+      requestHeaders = curl_slist_sort_insert(requestHeaders, "x-amz-security-token", accessToken.c_str());
   }
 
   uriencode = urlEncode(canonical_uri);
@@ -2572,7 +2614,7 @@ string S3fsCurl::CalcSignature(const string& method, const string& canonical_uri
   }else if (0 == strcmp(method.c_str(), "POST")) {
     StringCQ += uriencode + "\n";
   }
-  StringCQ += urlEncode2(query_string) + "\n";
+  StringCQ += urlEncode2(query) + "\n";
   StringCQ += get_canonical_headers(requestHeaders) + "\n";
   StringCQ += get_sorted_header_keys(requestHeaders) + "\n";
   StringCQ += payload_hash;
@@ -2581,7 +2623,7 @@ string S3fsCurl::CalcSignature(const string& method, const string& canonical_uri
   unsigned char *kDate, *kRegion, *kService, *kSigning, *sRequest               = NULL;
   unsigned int  kDate_len,kRegion_len, kService_len, kSigning_len, sRequest_len = 0;
   char          hexsRequest[64 + 1];
-  int           kSecret_len = snprintf(kSecret, sizeof(kSecret), "AWS4%s", S3fsCurl::AWSSecretAccessKey.c_str());
+  int           kSecret_len = snprintf(kSecret, sizeof(kSecret), "AWS4%s", secretAccessKey.c_str());
   unsigned int  cnt;
 
   s3fs_HMAC256(kSecret, kSecret_len, reinterpret_cast<const unsigned char*>(strdate.data()), strdate.size(), &kDate, &kDate_len);
@@ -2667,8 +2709,9 @@ bool S3fsCurl::GetUploadId(string& upload_id)
   return result;
 }
 
-void S3fsCurl::insertV4Headers()
+void S3fsCurl::insertV4Headers(const std::string& ak, const std::string& sk, const std::string& token)
 {
+  string accessKeyId = !ak.empty() ? ak : AWSAccessKeyId;
   string server_path = type == REQTYPE_LISTBUCKET ? "/" : path;
   string payload_hash;
   switch (type) {
@@ -2718,15 +2761,16 @@ void S3fsCurl::insertV4Headers()
   requestHeaders = curl_slist_sort_insert(requestHeaders, "x-amz-date", date8601.c_str());
 
   if(!S3fsCurl::IsPublicBucket()){
-    string Signature = CalcSignature(op, realpath, query_string + (type == REQTYPE_PREMULTIPOST ? "=" : ""), strdate, contentSHA256, date8601);
-    string auth = "AWS4-HMAC-SHA256 Credential=" + AWSAccessKeyId + "/" + strdate + "/" + endpoint +
+    string Signature = CalcSignature(op, realpath, query_string + (type == REQTYPE_PREMULTIPOST ? "=" : ""), strdate, contentSHA256, date8601, sk, token);
+    string auth = "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/" + strdate + "/" + endpoint +
         "/s3/aws4_request, SignedHeaders=" + get_sorted_header_keys(requestHeaders) + ", Signature=" + Signature;
     requestHeaders = curl_slist_sort_insert(requestHeaders, "Authorization", auth.c_str());
   }
 }
 
-void S3fsCurl::insertV2Headers()
+void S3fsCurl::insertV2Headers(const std::string& ak, const std::string& sk, const std::string& token)
 {
+  string accessKeyId = !ak.empty() ? ak : AWSAccessKeyId;
   string resource;
   string turl;
   string server_path = type == REQTYPE_LISTBUCKET ? "/" : path;
@@ -2742,8 +2786,8 @@ void S3fsCurl::insertV2Headers()
   }
 
   if(!S3fsCurl::IsPublicBucket()){
-    string Signature = CalcSignatureV2(op, get_header_value(requestHeaders, "Content-MD5"), get_header_value(requestHeaders, "Content-Type"), date, resource);
-    requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("AWS " + AWSAccessKeyId + ":" + Signature).c_str());
+    string Signature = CalcSignatureV2(op, get_header_value(requestHeaders, "Content-MD5"), get_header_value(requestHeaders, "Content-Type"), date, resource, sk, token);
+    requestHeaders   = curl_slist_sort_insert(requestHeaders, "Authorization", string("AWS " + accessKeyId + ":" + Signature).c_str());
   }
 }
 
@@ -2757,7 +2801,7 @@ void S3fsCurl::insertIBMIAMHeaders()
   }
 }
 
-void S3fsCurl::insertAuthHeaders()
+void S3fsCurl::insertAuthHeaders(const std::string& ak, const std::string& sk, const std::string& token)
 {
   if(!S3fsCurl::CheckIAMCredentialUpdate()){
     S3FS_PRN_ERR("An error occurred in checking IAM credential.");
@@ -2768,9 +2812,9 @@ void S3fsCurl::insertAuthHeaders()
   if(S3fsCurl::is_ibm_iam_auth){
     insertIBMIAMHeaders();
   }else if(!S3fsCurl::is_sigv4){
-    insertV2Headers();
+    insertV2Headers(ak, sk, token);
   }else{
-    insertV4Headers();
+    insertV4Headers(ak, sk, token);
   }
 }
 
@@ -2926,13 +2970,13 @@ bool S3fsCurl::LoadIAMRoleFromMetaData(void)
   return (0 == result);
 }
 
-bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_only_c, bool is_copy)
+bool S3fsCurl::AddSseRequestHead(sse_type_t sseType, string& ssevalue, bool is_only_c, bool is_copy)
 {
-  if(SSE_S3 == ssetype){
+  if(SSE_S3 == sseType){
     if(!is_only_c){
       requestHeaders = curl_slist_sort_insert(requestHeaders, "x-amz-server-side-encryption", "AES256");
     }
-  }else if(SSE_C == ssetype){
+  }else if(SSE_C == sseType){
     string sseckey;
     if(S3fsCurl::GetSseKey(ssevalue, sseckey)){
       if(is_copy){
@@ -2948,7 +2992,7 @@ bool S3fsCurl::AddSseRequestHead(sse_type_t ssetype, string& ssevalue, bool is_o
       S3FS_PRN_WARN("Failed to insert SSE-C header.");
     }
 
-  }else if(SSE_KMS == ssetype){
+  }else if(SSE_KMS == sseType){
     if(!is_only_c){
       if(ssevalue.empty()){
         ssevalue = S3fsCurl::GetSseKmsId();
@@ -3005,7 +3049,6 @@ bool S3fsCurl::PreHeadRequest(const char* tpath, const char* bpath, const char* 
     if(0 <= ssekey_pos){
       string md5("");
       if(!S3fsCurl::GetSseKeyMd5(ssekey_pos, md5) || !AddSseRequestHead(SSE_C, md5, true, false)){
-        S3FS_PRN_ERR("Failed to set SSE-C headers for sse-c key pos(%d)(=md5(%s)).", ssekey_pos, md5.c_str());
         return false;
       }
     }
@@ -3557,17 +3600,16 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
                                               char* buf,
                                               off_t start,
                                               size_t size,
-                                              sse_type_t ssetype,
+                                              sse_type_t sseType,
                                               string& ssevalue,
                                               const char *shardkey,
                                               const char *inodeNoStr)
 {
-  //if req with inodeNo,default true
-  int reqWithInodeNo = HwsGetIntConfigValue(HWS_REQUEST_WITH_INODENO);
-  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd][ssetype=%d][ssevalue=%s]ifWithInode=%d",
-    SAFESTRPTR(tpath), (intmax_t)start, size, ssetype, ssevalue.c_str(),reqWithInodeNo);
 
-  if(!tpath || 0 > start || 0 > size){
+  S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd][ssetype=%d][ssevalue=%s]",
+    SAFESTRPTR(tpath), (intmax_t)start, size, sseType, ssevalue.c_str());
+
+  if(!tpath || 0 > start){
     return -1;
   }
 
@@ -3576,17 +3618,9 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
   }
   string resource;
   string turl;
-  //if req with inodeNo,default true
-  if (reqWithInodeNo)
-  {
-      path            = "/" + string(inodeNoStr);
-      MakeUrlResource(path.c_str(), resource, turl);
-  }
-  else
-  {
-      MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);    
-      path            = get_realpath(tpath);
-  }
+
+  MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+  path            = get_realpath(tpath);
 
   url             = prepare_url(turl.c_str());
   S3FS_PRN_DBG("[inodeStr=%s],[turl=%s],[url=%s],[path=%s]", inodeNoStr, turl.c_str(), url.c_str(), path.c_str());
@@ -3602,25 +3636,17 @@ int S3fsCurl::PreReadFromFileObject(const char* tpath,
     requestHeaders = curl_slist_sort_insert(requestHeaders, "Range", range.c_str());
   }
   // SSE
-  if(!AddSseRequestHead(ssetype, ssevalue, true, false)){
+  if(!AddSseRequestHead(sseType, ssevalue, true, false)){
     S3FS_PRN_WARN("Failed to set SSE header, but continue...");
   }
 
-  // "x-hws-s3fs-client", true always
-  requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_client, "true");
-  //if req with inodeNo,default true
-  if (reqWithInodeNo)
-  {
-      if (0 != strcmp(shardkey, ""))
-      {
-          requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(shardkey).c_str());
-      }
+  //add iNode into header
+  requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_inodeNo, inodeNoStr);
+
+  if (0 != strcmp(shardkey, "")) {
+    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_shardkey, urlEncode(shardkey).c_str());
   }
-  else
-  {
-      //notify osc:object name use absolute path
-      requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_req_objname_use_path, "true");
-  }
+
 
   string maxDHTViewVersion = toString(getMaxDHTViewVersionId());
   requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_dht_version, maxDHTViewVersion.c_str());
@@ -3663,22 +3689,22 @@ int S3fsCurl::ReadFromFileObject(const char* tpath,
   if(!tpath){
     return -1;
   }
-  sse_type_t ssetype;
+  sse_type_t sseType;
   string     ssevalue;
 
   if (notGetSse)
   {
-    ssetype = SSE_DISABLE;
+    sseType = SSE_DISABLE;
     ssevalue.erase();
   }
   else
   {
-    if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+    if(!get_object_sse_type(tpath, sseType, ssevalue)){
       S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
     }
   }
 
-  if(0 != (result = PreReadFromFileObject(tpath, buf, start, size, ssetype, ssevalue, shardkey, inodeNoStr))){
+  if(0 != (result = PreReadFromFileObject(tpath, buf, start, size, sseType, ssevalue, shardkey, inodeNoStr))){
     return result;
   }
 
@@ -3710,13 +3736,11 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
     string fsVersionId      = toString(fileMeta->fsVersionId);
     string plogHeadVersion  = toString(fileMeta->plogheadVersion);
 	string originName  = fileMeta->originName;
-    //if req with inodeNo,default true
-    int reqWithInodeNo = HwsGetIntConfigValue(HWS_REQUEST_WITH_INODENO);
 
-    S3FS_PRN_INFO3("[inodeNoStr=%s],[shardKey=%s],[write_positon=%s],[size=%jd]ifWithInode=%d",
+    S3FS_PRN_INFO3("[inodeNoStr=%s],[shardKey=%s],[write_positon=%s],[size=%jd]",
         SAFESTRPTR(inodeNoStr.c_str()),SAFESTRPTR(dentryname.c_str()),
            SAFESTRPTR(offsetStr.c_str()),
-           databuff->ulBufferSize,reqWithInodeNo);
+           databuff->ulBufferSize);
     //timeval create_handle_tv;
     //s3fsStatisStart(WRITE_CUR_HANDLE_DELAY, &create_handle_tv);
 
@@ -3732,18 +3756,10 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
     string resource;
     string turl;
     timeval begin_tv;
-    //if req with inodeNo,default true
-    if (reqWithInodeNo)
-    {
-        path            = "/" + inodeNoStr;
-        MakeUrlResource(path.c_str(), resource, turl);
-    }
-    else
-    {
-        MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);    
-        path            = get_realpath(tpath);
-    }
-    
+
+    //obsfs use absolute path for obs permission check
+    MakeUrlResource(get_realpath(tpath).c_str(), resource, turl);
+    path            = get_realpath(tpath);
 
     turl           += urlargs;
     url             = prepare_url(turl.c_str());
@@ -3778,23 +3794,12 @@ int S3fsCurl::WriteBytesToFileObject(const char    *tpath,
         requestHeaders = curl_slist_sort_insert(requestHeaders, "Content-MD5", strMD5.c_str());
     }
 
-    // "x-hws-s3fs-client", true always
-    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_client, "true");
-    
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_connection, "keep-alive");
 
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_obs_meta_mtime, str(time(NULL)).c_str());
-    if (reqWithInodeNo)
-    {
-        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_plog_headversion, plogHeadVersion.c_str());
-        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_version_id, fsVersionId.c_str());
-        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_origin_name, urlEncode(originName).c_str());
-    }
-    else
-    {
-        //notify osc:object name use absolute path
-        requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_req_objname_use_path, "true");
-    }
+
+    //add iNode into header
+    requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_inodeNo, inodeNoStr.c_str());
 
     string maxDHTViewVersion = toString(getMaxDHTViewVersionId());
     requestHeaders = curl_slist_sort_insert(requestHeaders, hws_s3fs_dht_version, maxDHTViewVersion.c_str());
@@ -3923,7 +3928,7 @@ int S3fsCurl::RenameFileOrDirObject(const char *from, const char *to, bool& need
     return result;
 }
 
-int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size, sse_type_t ssetype, string& ssevalue)
+int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size, sse_type_t sseType, string& ssevalue)
 {
   S3FS_PRN_INFO3("[tpath=%s][start=%jd][size=%zd]", SAFESTRPTR(tpath), (intmax_t)start, size);
 
@@ -3951,7 +3956,7 @@ int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_
     requestHeaders = curl_slist_sort_insert(requestHeaders, "Range", range.c_str());
   }
   // SSE
-  if(!AddSseRequestHead(ssetype, ssevalue, true, false)){
+  if(!AddSseRequestHead(sseType, ssevalue, true, false)){
     S3FS_PRN_WARN("Failed to set SSE header, but continue...");
   }
 
@@ -3974,7 +3979,7 @@ int S3fsCurl::PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_
   partdata.size       = size;
   b_partdata_startpos = start;
   b_partdata_size     = size;
-  b_ssetype           = ssetype;
+  b_ssetype           = sseType;
   b_ssevalue          = ssevalue;
   b_ssekey_pos        = -1;         // not use this value for get object.
 
@@ -3990,13 +3995,13 @@ int S3fsCurl::GetObjectRequest(const char* tpath, int fd, off_t start, ssize_t s
   if(!tpath){
     return -1;
   }
-  sse_type_t ssetype;
+  sse_type_t sseType;
   string     ssevalue;
-  if(!get_object_sse_type(tpath, ssetype, ssevalue)){
+  if(!get_object_sse_type(tpath, sseType, ssevalue)){
     S3FS_PRN_WARN("Failed to get SSE type for file(%s).", SAFESTRPTR(tpath));
   }
 
-  if(0 != (result = PreGetObjectRequest(tpath, fd, start, size, ssetype, ssevalue))){
+  if(0 != (result = PreGetObjectRequest(tpath, fd, start, size, sseType, ssevalue))){
     return result;
   }
 
@@ -4041,7 +4046,7 @@ int S3fsCurl::getMountPrefixInode(void)
 }
 
 
-int S3fsCurl::CheckBucket(void)
+int S3fsCurl::CheckBucket(const std::string& ak, const std::string& sk, const std::string& token)
 {
   S3FS_PRN_INFO3("check a bucket.");
 
@@ -4064,7 +4069,7 @@ int S3fsCurl::CheckBucket(void)
 
   op = "GET";
   type = REQTYPE_CHKBUCKET;
-  insertAuthHeaders();
+  insertAuthHeaders(ak, sk, token);
 
   // setopt
   curl_easy_setopt(hCurl, CURLOPT_URL, url.c_str());
@@ -4075,7 +4080,13 @@ int S3fsCurl::CheckBucket(void)
 
   int result = RequestPerform();
   if (result != 0) {
-    S3FS_PRN_ERR("Check bucket failed, S3 response: %s", (bodydata ? bodydata->str() : ""));
+    S3FS_PRN_ERR("Check bucket failed, OBS response: %s", (bodydata ? bodydata->str() : ""));
+    char *message = NULL;
+    getMessageFromBodydata((bodydata ? bodydata->str() : ""), &message);
+    S3FS_PRN_EXIT("Check bucket failed, OBS response: %s", (message ? message : ""));
+    if (message){
+        free(message);
+    }
   }
   return result;
 }
@@ -4120,7 +4131,12 @@ int S3fsCurl::ListBucketRequest(const char* tpath, const char* query)
   curl_easy_setopt(hCurl, CURLOPT_HTTPHEADER, requestHeaders);
   S3fsCurl::AddUserAgent(hCurl);        // put User-Agent
 
-  return RequestPerform();
+  timeval begin_tv;
+  s3fsStatisStart(LIST_BUCKET_LIB_CURL, &begin_tv);
+  int result =  RequestPerform();
+  s3fsStatisEnd(LIST_BUCKET_LIB_CURL, &begin_tv);
+
+  return result;
 }
 
 //
@@ -4732,7 +4748,7 @@ int S3fsCurl::MultipartUploadRequest(const string& upload_id, const char* tpath,
   // set
   partdata.fd         = fd2;
   partdata.startpos   = offset;
-  partdata.size       = size;
+  partdata.size       = (ssize_t)(size);
   b_partdata_startpos = partdata.startpos;
   b_partdata_size     = partdata.size;
   partdata.add_etag_list(&list);
@@ -5054,10 +5070,7 @@ struct curl_slist* curl_slist_sort_insert(struct curl_slist* list, const char* k
   if(!key){
     return list;
   }
-
-/* file gateway modify begin */
-  S3FS_PRN_DBG("[list=%p],[key=%s],[value=%s]", list, key, value);
-/* file gateway modify end */
+  
   if(NULL == (new_item = (struct curl_slist*)malloc(sizeof(struct curl_slist)))){
     return list;
   }
@@ -5240,13 +5253,13 @@ string prepare_url(const char* url)
   S3FS_PRN_INFO3("URL is %s", url);
 
   string uri;
-  string host;
+  string host_str;
   string path;
   string url_str = string(url);
   string token = string("/") + bucket;
-  int bucket_pos = url_str.find(token);
-  int bucket_length = token.size();
-  int uri_length = 0;
+  string::size_type bucket_pos = url_str.find(token);
+  string::size_type bucket_length = token.size();
+  unsigned int uri_length = 0;
 
   if(!strncasecmp(url_str.c_str(), "https://", 8)){
     uri_length = 8;
@@ -5256,10 +5269,10 @@ string prepare_url(const char* url)
   uri  = url_str.substr(0, uri_length);
 
   if(!pathrequeststyle){
-    host = bucket + "." + url_str.substr(uri_length, bucket_pos - uri_length).c_str();
+    host_str = bucket + "." + url_str.substr(uri_length, bucket_pos - uri_length).c_str();
     path = url_str.substr((bucket_pos + bucket_length));
   }else{
-    host = url_str.substr(uri_length, bucket_pos - uri_length).c_str();
+    host_str = url_str.substr(uri_length, bucket_pos - uri_length).c_str();
     string part = url_str.substr((bucket_pos + bucket_length));
     if('/' != part[0]){
       part = "/" + part;
@@ -5267,7 +5280,7 @@ string prepare_url(const char* url)
     path = "/" + bucket + part;
   }
 
-  url_str = uri + host + path;
+  url_str = uri + host_str + path;
 
   S3FS_PRN_INFO3("URL changed is %s", url_str.c_str());
 
