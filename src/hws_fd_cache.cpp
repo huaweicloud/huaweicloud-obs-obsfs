@@ -1,3 +1,16 @@
+/*
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
 #include <string.h>
 #include <assert.h>
 #include <time.h>
@@ -66,7 +79,7 @@ bool g_wholeFileCacheSwitch = false; //default false
 off64_t g_wholeFileCacheMaxMemSize = 1024 * HWS_MB_SIZE;
 int g_wholeFileCachePreReadStatisPeriod = 5; //seconds
 int g_wholeFileCacheNotHitTimesPerPeriod = 300;
-off64_t g_wholeFileCacheNotHitSizePerPeriod = 5 * HWS_MB_SIZE;
+size_t g_wholeFileCacheNotHitSizePerPeriod = 5 * HWS_MB_SIZE;
 int g_wholeFileCachePreReadInterval = 50; //ms
 int g_wholeFileCacheMaxRecycleTime = 10800; //seconds
 off64_t g_wholeFileCacheMaxHitTimes = 500000;
@@ -280,9 +293,9 @@ void read_thread_task(struct HwsFdReadPage* page)
 #endif
     std::lock_guard<std::mutex> lock(page->read_ahead_mutex_);
     clock_gettime(CLOCK_MONOTONIC_COARSE, &page->got_ts_);
-    if(read_size > 0)
+    if (read_size > 0)
     {
-        page->read_size_ = read_size;
+        page->read_size_ = (size_t)(read_size);
         if(page->state_ == HWS_FD_READ_STATE_RECVING)
         {
             page->state_ = HWS_FD_READ_STATE_RECVED;
@@ -332,11 +345,15 @@ void whole_file_cache_task(long long inodeNo)
             break;
         }
 
-        struct HwsFdReadPage *page = new(std::nothrow) HwsFdReadPage(path.c_str(), 
-                offset, gReadPageSize, entity_mutex, NULL);
-        if (nullptr == page)
-        {
+        struct HwsFdReadPage *page = new(std::nothrow) HwsFdReadPage(path.c_str(),offset, gReadPageSize, entity_mutex, NULL);
+        if (nullptr == page) {
             S3FS_PRN_ERR("alloc read page fail! path(%s)offset(%ld)(%lld)", path.c_str(), offset, inodeNo);
+            break;
+        }
+        int ret = page->Init();
+        if (ret != 0){
+            delete page;
+            page = nullptr;
             break;
         }
         ssize_t read_size = 0;
@@ -345,7 +362,7 @@ void whole_file_cache_task(long long inodeNo)
         std::lock_guard<std::mutex> lock(page->read_ahead_mutex_);
         if(read_size > 0)
         {
-            page->read_size_ = read_size;
+            page->read_size_ = (size_t)(read_size);
             if(page->state_ == HWS_FD_READ_STATE_RECVING)
             {
                 page->state_ = HWS_FD_READ_STATE_RECVED;
@@ -429,7 +446,7 @@ void setFdWholeFileCacheParasByCfg()
     g_wholeFileCacheMaxMemSize = (off64_t)HwsGetIntConfigValue(HWS_WHOLE_CACHE_MAX_MEM_SIZE) * 1024 * HWS_MB_SIZE;
     g_wholeFileCachePreReadStatisPeriod = HwsGetIntConfigValue(HWS_WHOLE_CACHE_STATIS_PERIOD);
     g_wholeFileCacheNotHitTimesPerPeriod = HwsGetIntConfigValue(HWS_WHOLE_CACHE_READ_TIMES);
-    g_wholeFileCacheNotHitSizePerPeriod = (off64_t)HwsGetIntConfigValue(HWS_WHOLE_CACHE_READ_SIZE) * HWS_MB_SIZE;
+    g_wholeFileCacheNotHitSizePerPeriod = (size_t)(unsigned int)HwsGetIntConfigValue(HWS_WHOLE_CACHE_READ_SIZE) * HWS_MB_SIZE;
     g_wholeFileCachePreReadInterval = HwsGetIntConfigValue(HWS_WHOLE_CACHE_READ_INTERVAL_MS);
     g_wholeFileCacheMaxRecycleTime = HwsGetIntConfigValue(HWS_WHOLE_CACHE_MAX_RECYCLE_TIME);
     g_wholeFileCacheMaxHitTimes = (off64_t)HwsGetIntConfigValue(HWS_WHOLE_CACHE_MAX_HIT_TIMES) * 1000;
@@ -485,8 +502,8 @@ void setFdCacheGlobalVariableByCfg()
     S3FS_DATA_CACHE_PRN_LOG(
         "gReadStatSize=%d,gReadStatSeqSize=%d,StatSizeThreshold=%ld",
         gReadStatSize,gReadStatSeqSize,gReadStatSizeThreshold);
-    gWritePageNum = HwsGetIntConfigValue(HWS_WRITE_PAGE_NUM);
-    gReadPageNum = HwsGetIntConfigValue(HWS_READ_PAGE_NUM);
+    gWritePageNum = (unsigned int)(HwsGetIntConfigValue(HWS_WRITE_PAGE_NUM));
+    gReadPageNum = (unsigned int)(HwsGetIntConfigValue(HWS_READ_PAGE_NUM));
     S3FS_DATA_CACHE_PRN_LOG(
          "gWritePageNum=%d, gReadPageNum=%d,", gWritePageNum, gReadPageNum);
     gFreeCacheThresholdPercent = HwsGetIntConfigValue(HWS_FREE_CACHE_THRESHOLD_PERCENT);        
@@ -591,6 +608,31 @@ void* AllocMemWithRetry(size_t size)
 
     return buffer;
 }
+
+int HwsFdWritePage::Init(){
+    data_ = new(std::nothrow) char[write_page_size_];
+    if (nullptr == data_){
+        S3FS_PRN_ERR("alloc write page fail!path(%s) offset(%ld)",
+                     path_.c_str(), offset_);
+        return -ENOMEM;
+    }
+
+    if (NULL == thread_task_){
+        S3FS_PRN_ERR("thread task is NULL, path(%s) offset(%ld)",
+                     path_.c_str(), offset_);
+        return -EINVAL;
+    }
+
+    try {
+        thread_ = std::thread(thread_task_, this);
+        thread_start = true;
+    } catch (const std::system_error &e) {
+        S3FS_PRN_ERR("create thread fail,path(%s)off(%ld)write_page_size(%lu)",
+                     path_.c_str(), offset_, write_page_size_);
+        return -EAGAIN;
+    }
+    return 0;
+}
 /*copy intersect write to last page;  
   must lock write_merge_mutex_ in caller*/
 size_t HwsFdWritePage::IntersectWriteMergeToLastpage(
@@ -613,8 +655,8 @@ size_t HwsFdWritePage::IntersectWriteMergeToLastpage(
             path_.c_str(),wrtOffset,wrtSize);
         return 0;
     }
-    size_t copy_offset_in_page = wrtOffset - offset_;
-    if (copy_offset_in_page + wrtSize >= write_page_size_)
+    off64_t copy_offset_in_page = wrtOffset - offset_;
+    if ((size_t)(copy_offset_in_page) + wrtSize >= write_page_size_)
     {
         //write end beyond page size
         S3FS_PRN_WARN(
@@ -624,12 +666,12 @@ size_t HwsFdWritePage::IntersectWriteMergeToLastpage(
     }
 
     memcpy(data_+copy_offset_in_page, buf, wrtSize);
-    bytes_ = max(bytes_,copy_offset_in_page+wrtSize);
+    bytes_ = max(bytes_,(size_t)(copy_offset_in_page)+wrtSize);
     // update last_write_ts
     clock_gettime(CLOCK_MONOTONIC_COARSE, &last_write_ts_);
     S3FS_DATA_CACHE_PRN_LOG(
         "merge to last,path(%s)offset(%ld),size(%lu)pageoff(%ld)"
-        "bytes(%lu)copyOffset(%lu)",
+        "bytes(%lu)copyOffset(%ld)",
         path_.c_str(),wrtOffset,wrtSize,offset_,bytes_,copy_offset_in_page);
     return wrtSize;    
 }
@@ -719,12 +761,15 @@ HwsFdWritePage* HwsFdWritePageList::NewWritePage(const char *path,
                 }
 #endif        
 
-    newPage = new HwsFdWritePage(path, offset, write_page_size,
+    newPage = new(std::nothrow) HwsFdWritePage(path, offset, write_page_size,
         write_merge_mutex_, write_thread_task);   
-    if (nullptr == newPage->GetDataBuf())
+    if (nullptr != newPage)
     {
-        delete newPage;
-        newPage = nullptr;
+        int ret = newPage->Init();
+        if (ret != 0){
+            delete newPage;
+            newPage = nullptr;
+        }
     }
     return newPage;
 }
@@ -928,7 +973,7 @@ bool HwsFdWritePageList::canIntersectWrtMergeToLastPage(
   must lock write_merge_mutex_ in caller;
   Return Value: read success size */
 int HwsFdWritePageList::ReadLastOverLap(const char* path,
-        HwsWriteLastPageRead_S *readInfo, size_t offset, size_t readSize)
+        HwsWriteLastPageRead_S *readInfo, off64_t offset, size_t readSize)
 {
 	if (0 == pages_.size())
 	{
@@ -942,8 +987,8 @@ int HwsFdWritePageList::ReadLastOverLap(const char* path,
         (readInfo->file_offset_ < page->offset_ + (off64_t)page->bytes_) &&
         (readInfo->file_offset_ >= page->offset_))
 	{
-		size_t copy_offset_in_page = readInfo->file_offset_ - page->offset_;
-		readInfo->read_bytes_ = min(readSize, page->bytes_ - copy_offset_in_page);
+		off64_t copy_offset_in_page = readInfo->file_offset_ - page->offset_;
+		readInfo->read_bytes_ = min(readSize, page->bytes_ - (size_t)(copy_offset_in_page));
 		if (readInfo->read_bytes_ <= gFuseMaxReadSize)
 		{
 			memcpy(readInfo->buffer_, page->data_ + copy_offset_in_page, readInfo->read_bytes_);
@@ -993,6 +1038,30 @@ HwsFdWritePageList::~HwsFdWritePageList()
     }
 }
 
+int HwsFdReadPage::Init()
+{
+    data_ = new(std::nothrow) char[read_page_size_];
+    if (nullptr == data_){
+        S3FS_PRN_ERR("alloc read page fail!path(%s) offset(%ld)",
+                     path_.c_str(), offset_);
+        return -ENOMEM;
+    }
+    if (NULL == thread_task_){
+        S3FS_PRN_ERR("thread task is NULL, path(%s) offset(%ld)",
+                     path_.c_str(), offset_);
+        return -EINVAL;
+    }
+
+    try {
+        thread_ = std::thread(thread_task_, this);
+    } catch (const std::system_error &e) {
+        S3FS_PRN_ERR("create thread fail,path(%s)off(%ld)read_page_size(%lu)",
+                     path_.c_str(), offset_, read_page_size_);
+        return -EAGAIN;
+    }
+    return 0;
+}
+
 void HwsFdReadPage::GenerateCrc(ssize_t read_size)
 {
     char* data = data_;
@@ -1007,7 +1076,7 @@ void HwsFdReadPage::GenerateCrc(ssize_t read_size)
     }
 }
 
-bool HwsFdReadPage::CheckCrcErr(size_t offset, size_t size)
+bool HwsFdReadPage::CheckCrcErr(off64_t offset, size_t size)
 {
     if(!gIsCheckCRC)
     {
@@ -1018,11 +1087,11 @@ bool HwsFdReadPage::CheckCrcErr(size_t offset, size_t size)
         return false;
     }
     int start_crc_no = offset/HWS_READ_CRC_SIZE;
-    int end_crc_no = (offset + size - 1)/HWS_READ_CRC_SIZE;
-    int real_crc_num = (read_size_ + HWS_READ_CRC_SIZE - 1)/HWS_READ_CRC_SIZE;
+    int end_crc_no = (offset + (off64_t)(size) - 1)/HWS_READ_CRC_SIZE;
+    int real_crc_num = (int)((read_size_ + HWS_READ_CRC_SIZE - 1)/HWS_READ_CRC_SIZE);
     for(int i = start_crc_no; i <= end_crc_no && i < real_crc_num; i++)
     {
-        char *data = data_+HWS_READ_CRC_SIZE*i;
+        char *data = data_ + (int64_t)(HWS_READ_CRC_SIZE * i);
         if(crc_[i] != rocksdb::crc32c::Value(data, HWS_READ_CRC_SIZE))
         {
             return true;
@@ -1118,12 +1187,13 @@ void HwsFdReadStatVec::Add(const char* path,
         if(stat_[loop+seq_size_-1].offset - stat_[loop].offset <= gReadStatSizeThreshold)
         {
             isSequential_ = true;
-            offset_ = stat_[loop+seq_size_-1].offset + stat_[loop+seq_size_-1].size;
+            offset_ = stat_[loop+seq_size_-1].offset + (off64_t)(stat_[loop+seq_size_-1].size);
             break;
         }
     }
     if (isSequentialOld != isSequential_)
-    {
+    {
+
         S3FS_DATA_CACHE_PRN_LOG(
           "change isSequential=%d,path(%s)readAheadOff(%ld)",
         isSequential_,path,offset_);        
@@ -1178,7 +1248,7 @@ int HwsFdReadPageList::Read(const char* path,char *buf, off64_t offset, size_t s
     off64_t copy_offset = offset;
     size_t copy_left_size = size;   /*size not copy*/
     size_t copied_size = 0;
-    size_t copy_offset_in_page = 0;
+    off64_t copy_offset_in_page = 0;
     size_t page_copy_size =0;
     unsigned int hit_page_num = 0;
     unsigned int cur_page_num = pages_.size();
@@ -1190,7 +1260,7 @@ int HwsFdReadPageList::Read(const char* path,char *buf, off64_t offset, size_t s
         {
             continue;
         }
-        off64_t page_end = page->offset_ + page->read_size_;
+        off64_t page_end = page->offset_ + (off64_t)(page->read_size_);
         /*left part must in page; if only right part in page,read from obs*/
         if((copy_offset >= page->offset_) && (copy_offset < page_end))
         {
@@ -1203,19 +1273,19 @@ int HwsFdReadPageList::Read(const char* path,char *buf, off64_t offset, size_t s
                     path, offset, size,page->offset_,copied_size);
                 break;
             }
-            page_copy_size = min(copy_left_size, page->read_size_ - copy_offset_in_page);
+            page_copy_size = min(copy_left_size, page->read_size_ - (size_t)(copy_offset_in_page));
             if(page->CheckCrcErr(copy_offset_in_page, page_copy_size))
             {
-                S3FS_PRN_ERR("hws fd cache read crc error path(%s) offset(%ld) size(%lu) read(%lu, %lu)", 
+                S3FS_PRN_ERR("hws fd cache read crc error path(%s) offset(%ld) size(%lu) read(%ld, %lu)", 
                     path, page->offset_, page->read_page_size_, copy_offset_in_page, page_copy_size);
                 return 0;
             }
             memcpy(buf + copied_size, page->data_ + copy_offset_in_page, page_copy_size);
-            copy_offset += page_copy_size;
+            copy_offset += (off64_t)(page_copy_size);
             copied_size += page_copy_size;
             copy_left_size -= page_copy_size;
             hit_page_num++;
-            hit_file_offset = page->offset_ + copy_offset_in_page + page_copy_size;
+            hit_file_offset = page->offset_ + copy_offset_in_page + (off64_t)(page_copy_size);
             page->hitSizeInPage += page_copy_size;
             if(hit_file_offset > hit_max_offset_)
             {
@@ -1303,18 +1373,18 @@ bool HwsFdReadPageList::PageNeedFree(HwsFdReadPage* page)
         return true;
     }      
     //if 90% page is hit,and last read offset beyond page end,delete
-    off64_t dataSize = 
+    size_t dataSize = 
         (page->read_size_ > 0)? page->read_size_:gReadPageSize;
-    off64_t hitPercent = page->hitSizeInPage * 100 / dataSize;
+    unsigned int hitPercent = page->hitSizeInPage * 100 / dataSize;
     if (hitPercent > 90 && lastReadOffset > (pageEnd + HWS_MB_SIZE))
     {
         S3FS_DATA_CACHE_PRN_LOG(
-          "free read page,path(%s)off(%ld)hitPer(%ld),lastRead(%ld)pgEnd(%ld)", 
+          "free read page,path(%s)off(%ld)hitPer(%u),lastRead(%ld)pgEnd(%ld)", 
             page->path_.c_str(), page->offset_,hitPercent,lastReadOffset,pageEnd);
         return true;
     }
-    /*1¡¢if page timeout£¬delete
-      2¡¢if page offset less than cleanPageOffset£¬then delete*/ 
+    /*1.if page timeout,delete
+      2.if page offset less than cleanPageOffset,then delete*/
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &now_ts);
     long diffMsRecved = diff_in_ms(&page->got_ts_, &now_ts);
@@ -1331,7 +1401,7 @@ bool HwsFdReadPageList::PageNeedFree(HwsFdReadPage* page)
     }
     S3FS_DATA_CACHE_PRN_LOG(
       "free read page,path(%s)off(%ld)bytes(%lu),pageNum(%u)clnOff(%ld)"
-      "diffRecv(%ld)diffLast(%ld)thres(%ld)hitMax(%ld)hitSz(%ld)", 
+      "diffRecv(%ld)diffLast(%ld)thres(%ld)hitMax(%ld)hitSz(%lu)", 
         page->path_.c_str(), page->offset_,page->read_size_,cur_page_num,
         cleanPageOffset,diffMsRecved,diffMsLastHit,gReadPageCleanMs,
         hit_max_offset_,page->hitSizeInPage);
@@ -1427,11 +1497,16 @@ void HwsFdReadPageList::ReadAheadOnePage(const char* path, off64_t offset,
         return;        
     }
     struct HwsFdReadPage *newPage = new(std::nothrow) HwsFdReadPage(path,
-        readAheadOffset,read_page_size_,read_ahead_mutex_, read_thread_task);
-    if (nullptr == newPage)
-    {
-        S3FS_PRN_ERR("alloc read page fail!path(%s) offset(%ld)", 
-            path, offset);                
+                                      readAheadOffset, read_page_size_,
+                                      read_ahead_mutex_, read_thread_task);
+    if (nullptr == newPage) {
+        S3FS_PRN_ERR("alloc read page fail!path(%s) offset(%ld)",path, offset);
+        return;
+    }
+    int ret = newPage->Init();
+    if (ret != 0){
+        delete newPage;
+        newPage = nullptr;
         return;
     }
     HwsFdManager::GetInstance().AddCacheMemSize(read_page_size_);
@@ -1516,7 +1591,7 @@ void HwsFdReadPageList::ReadAhead(const char* path, off64_t offset,
   must lock read_ahead_mutex_ in caller*/
 void HwsFdReadPageList::Invalid(off64_t offset, size_t size)
 {
-    off64_t end = offset + size;
+    off64_t end = offset + (off64_t)(size);
     for(auto iter = pages_.begin(); iter != pages_.end(); iter++)
     {
         HwsFdReadPage* page = *iter;
@@ -1618,7 +1693,7 @@ int HwsFdEntity::ReadFromWholeFileCache(const char* path, char* buf, off64_t off
     off64_t copy_offset = offset;
     size_t copy_left_size = size;   /*size not copy*/
     size_t copied_size = 0;
-    size_t copy_offset_in_page = 0;
+    off64_t copy_offset_in_page = 0;
     size_t page_copy_size =0;
 
     std::deque<HwsFdReadPage*>& pages = wholeCachePage_.pages_;
@@ -1631,7 +1706,7 @@ int HwsFdEntity::ReadFromWholeFileCache(const char* path, char* buf, off64_t off
             continue;
         }
         page->ReadPageRef();
-        off64_t page_end = page->offset_ + page->read_size_;
+        off64_t page_end = page->offset_ + (off64_t)(page->read_size_);
         /*left part must in page; if only right part in page,read from obs*/
         if((copy_offset >= page->offset_) && (copy_offset < page_end))
         {
@@ -1645,9 +1720,9 @@ int HwsFdEntity::ReadFromWholeFileCache(const char* path, char* buf, off64_t off
                 page->ReadPageUnref();
                 break;
             }
-            page_copy_size = min(copy_left_size, page->read_size_ - copy_offset_in_page);
+            page_copy_size = min(copy_left_size, page->read_size_ - (size_t)(copy_offset_in_page));
             memcpy(buf + copied_size, page->data_ + copy_offset_in_page, page_copy_size);
-            copy_offset += page_copy_size;
+            copy_offset += (off64_t)(page_copy_size);
             copied_size += page_copy_size;
             copy_left_size -= page_copy_size;
         }
@@ -1830,7 +1905,7 @@ int HwsFdEntity::Write(const char* buf, off64_t offset, size_t size, const char*
 
     if(IsNeedWriteMerge(path_.c_str(),offset, size, entity_lock))
     {
-        res = AppendToPageWithRetry(path_.c_str(),buf,offset,size,entity_lock);
+        res = (int)(AppendToPageWithRetry(path_.c_str(),buf,offset,size,entity_lock));
         /*retry but not sequential,send to obs direct*/
         if(res < (int)size)
         {
@@ -1924,11 +1999,16 @@ int HwsFdEntity::Read(char* buf, off64_t offset, size_t size, const char* path)
             path_.c_str(), offset, writePageLastReadStru.read_bytes_);
         HwsCacheStatis::GetInstance().AddStatisNum(READ_LAST_WRT_PAGE);
         /*read from obs*/
-		size_t read_obs_size = 0;
+		ssize_t read_obs_size = 0;
 		if (writePageLastReadStru.read_bytes_ < size)
 		{
 			read_obs_size = recvfrom_obs(path_.c_str(), buf, size, offset);
-			S3FS_PRN_DBG("hws fd cache read from obs sucess,path(%s),offset(%ld),size(%zu)", 
+			if (read_obs_size < 0) {
+				S3FS_PRN_ERR("hws fd cache read from obs fail, path(%s),offset(%ld),size(%zd)", path_.c_str(),offset, read_obs_size);
+				free(writePageLastReadStru.buffer_);
+				return read_obs_size;
+            }
+			S3FS_PRN_DBG("hws fd cache read from obs sucess,path(%s),offset(%ld),size(%zd)", 
                 path_.c_str(),offset, read_obs_size);
 		}
 		
@@ -1937,12 +2017,12 @@ int HwsFdEntity::Read(char* buf, off64_t offset, size_t size, const char* path)
 		
         /*free writePageReadStru buf*/
         free(writePageLastReadStru.buffer_);
-        return max(writePageLastReadStru.read_bytes_, read_obs_size);
+        return max(writePageLastReadStru.read_bytes_, (size_t)(read_obs_size));
     }
     /*free writePageReadStru buf*/
     free(writePageLastReadStru.buffer_);
     
-    /*4,read page overlap£¬wait*/
+    /*4,read page overlap,wait*/
     if(gIsReadWaitCache)
     {
         HwsFdReadPage* readPage = nullptr;
@@ -2093,7 +2173,7 @@ off64_t HwsFdManager::GetUsedCacheMemSize()
 unsigned int HwsFdManager::GetWritePageNumByCacheSize()
 {
     off64_t freeCacheSize = GetFreeCacheMemSize();
-    off64_t pageNum = gWritePageNum * freeCacheSize/gMaxCacheMemSize;
+    off64_t pageNum = (off64_t)(gWritePageNum) * freeCacheSize/gMaxCacheMemSize;
     pageNum = max(g_MinReadWritePageByCacheSize,pageNum);
     return (unsigned int)pageNum;
 }
@@ -2110,7 +2190,7 @@ unsigned int HwsFdManager::GetReadPageNumByCacheSize()
         clock_gettime(CLOCK_MONOTONIC_COARSE, &print_free_cache_ts_);        
     }
     
-    off64_t pageNum = gReadPageNum * freeCacheSize/gMaxCacheMemSize;
+    off64_t pageNum = (off64_t)(gReadPageNum) * freeCacheSize/gMaxCacheMemSize;
     
     pageNum = max(g_MinReadWritePageByCacheSize,pageNum);
     return (unsigned int)pageNum;
@@ -2151,7 +2231,7 @@ void HwsFdManager::CheckCacheMemSize()
     for( HwsEntityMap::iterator iter=fent_.begin();iter!=fent_.end();iter++ )
     {
         ent = iter->second;
-        restaticSize += ent->CleanAndGetPageUsedMem();        
+        restaticSize += (off64_t)(ent->CleanAndGetPageUsedMem());        
     }
 
     char print_buffer[TIME_FORMAT_LENGTH];

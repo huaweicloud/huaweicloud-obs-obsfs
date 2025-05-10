@@ -1,3 +1,16 @@
+/*
+ * Copyright (C) 2018. Huawei Technologies Co., Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -54,6 +67,7 @@ std::string  statis_step[MAX_STEP_STATIS] = {"min_step",
                                              "read_file_lib_curl",
 
                                              "list_bucket",
+                                             "list_bucket_lib_curl",
 
                                              "open_file_total",
                                              
@@ -121,8 +135,8 @@ void s3fsShowStatis(){
 }
 unsigned long long getDiffUs(timeval* pBeginTime,timeval* pEndTime)
 {
-    unsigned long long diff = 1000000 * (pEndTime->tv_sec - pBeginTime->tv_sec) + 
-        pEndTime->tv_usec - pBeginTime->tv_usec;
+    unsigned long long diff = (unsigned long long)((1000000 * (pEndTime->tv_sec - pBeginTime->tv_sec) +
+        pEndTime->tv_usec - pBeginTime->tv_usec));
     return diff;
 }
 
@@ -137,8 +151,8 @@ void s3fsStatis(statis_type_t statisId, unsigned long long costTime,
     
     unsigned long long diffUs = getDiffUs(&(process_statis[statisId].lastPrintTime),pEndTime);
     /*print statis every 180 second or 5000 num*/
-    unsigned long long printPeriodUs = 
-        HwsGetIntConfigValue(HWS_CFG_STAT_PRINT_SECONDS)*1000000;
+    unsigned long long printPeriodUs =
+        (unsigned long long)(unsigned int)HwsGetIntConfigValue(HWS_CFG_STAT_PRINT_SECONDS)*1000000;
     if ( diffUs > printPeriodUs || 
         process_statis[statisId].numSum > (unsigned long long)HwsGetIntConfigValue(HWS_CFG_STAT_PRINT_COUNT))
     {
@@ -159,10 +173,10 @@ void s3fsStatis(statis_type_t statisId, unsigned long long costTime,
 
 void s3fsStatisStart(statis_type_t statisId, timeval *begin_tv){
     if (NULL == begin_tv){
-        S3FS_PRN_ERR("begin_tv is %p", begin_tv);
+        S3FS_PRN_ERR("begin_tv is NULL");
         return;
     }
-    if (0 > statisId || statisId >=  MAX_STEP_STATIS){
+    if (statisId >=  MAX_STEP_STATIS){
         S3FS_PRN_ERR("could not record this stepId[%d], maxStepId is[%d]", statisId, MAX_STEP_STATIS);
         return;
     }
@@ -176,7 +190,7 @@ void s3fsStatisEnd(statis_type_t statisId, timeval *pBeginTime,
         S3FS_PRN_ERR("pBeginTime is null");
         return;
     }
-    if (0 > statisId|| statisId>=  MAX_STEP_STATIS){
+    if (statisId>=  MAX_STEP_STATIS){
         S3FS_PRN_ERR("could not record this stepId[%d], maxStepId is[%d]", statisId, MAX_STEP_STATIS);
         return;
     }
@@ -184,7 +198,7 @@ void s3fsStatisEnd(statis_type_t statisId, timeval *pBeginTime,
     gettimeofday(&end_tv, NULL);
 
     unsigned long long diff = getDiffUs(pBeginTime,&end_tv);
-    unsigned long long statis_long_us = HwsGetIntConfigValue(HWS_CFG_STATIS_OPER_LONG_MS)*1000;
+    unsigned long long statis_long_us = (unsigned long long)(unsigned int)HwsGetIntConfigValue(HWS_CFG_STATIS_OPER_LONG_MS)*1000;
     if (NULL != urlOrPathStr && diff > statis_long_us)
     {
         S3FS_PRN_WARN("statisTime long,Step(%s),urlOrPathStr=%s,diff(%llu)",

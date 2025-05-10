@@ -47,12 +47,16 @@ std::string get_date_iso8601(time_t tm);
 std::string urlEncode(const std::string &s);
 std::string urlEncode2(const std::string &s);
 std::string urlDecode(const std::string& s);
+//do special decode for "+"(space)
+std::string urlDecodeSpecial(std::string str);
 bool takeout_str_dquart(std::string& str);
 bool get_keyword_value(std::string& target, const char* keyword, std::string& value);
 
 std::string s3fs_hex(const unsigned char* input, size_t length);
 char* s3fs_base64(const unsigned char* input, size_t length);
 unsigned char* s3fs_decode64(const char* input, size_t* plength);
+
+void getMessageFromBodydata(const char *bodydata, char **message);
 
 #endif // S3FS_STRING_UTIL_H_
 

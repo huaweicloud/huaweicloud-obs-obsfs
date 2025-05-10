@@ -23,6 +23,9 @@
 
 #include <cassert>
 
+#define LONG_RESPONSE_TIME_US 1000000
+#define US_PER_SECOND 1000000
+
 //----------------------------------------------
 // Symbols
 //----------------------------------------------
@@ -111,7 +114,7 @@ struct filepart
     if(list){
       list->push_back(std::string(""));
       etaglist = list;
-      etagpos  = list->size() - 1;
+      etagpos  = static_cast<int>(list->size() - 1);
     }else{
       etaglist = NULL;
       etagpos  = - 1;
@@ -153,6 +156,8 @@ public:
 
   CURL* GetHandler();
   void ReturnHandler(CURL* h);
+
+  int GetActiveCurlNum();
 
 private:
   int mMaxHandlers;
@@ -281,13 +286,13 @@ class S3fsCurl
     BodyData*            headdata;             // header data by WriteMemoryCallback
     long                 LastResponseCode;
     const unsigned char* postdata;             // use by post method and read callback function.
-    int                  postdata_remaining;   // use by post method and read callback function.
+    unsigned int         postdata_remaining;   // use by post method and read callback function.
     filepart             partdata;             // use by multipart upload/get object callback
     bool                 is_use_ahbe;          // additional header by extension
     int                  retry_count;          // retry count for multipart
     FILE*                b_infile;             // backup for retrying
     const unsigned char* b_postdata;           // backup for retrying
-    int                  b_postdata_remaining; // backup for retrying
+    unsigned int         b_postdata_remaining; // backup for retrying
     off_t                b_partdata_startpos;  // backup for retrying
     ssize_t              b_partdata_size;      // backup for retrying
     int                  b_ssekey_pos;         // backup for retrying
@@ -351,12 +356,12 @@ class S3fsCurl
     bool ResetHandle(void);
     bool RemakeHandle(void);
     bool ClearInternalData(void);
-    void insertV4Headers();
-    void insertV2Headers();
+    void insertV4Headers(const std::string& ak = "", const std::string& sk = "", const std::string& token = "");
+    void insertV2Headers(const std::string& ak = "", const std::string& sk = "", const std::string& token = "");
     void insertIBMIAMHeaders();
-    void insertAuthHeaders();
-    std::string CalcSignatureV2(const std::string& method, const std::string& strMD5, const std::string& content_type, const std::string& date, const std::string& resource);
-    std::string CalcSignature(const std::string& method, const std::string& canonical_uri, const std::string& query_string, const std::string& strdate, const std::string& payload_hash, const std::string& date8601);
+    void insertAuthHeaders(const std::string& ak = "", const std::string& sk = "", const std::string& token = "");
+    std::string CalcSignatureV2(const std::string& method, const std::string& strMD5, const std::string& content_type, const std::string& date, const std::string& resource, const std::string& sk = "", const std::string& token = "");
+    std::string CalcSignature(const std::string& method, const std::string& canonical_uri, const std::string& query_string, const std::string& strdate, const std::string& payload_hash, const std::string& date8601, const std::string& sk = "", const std::string& token = "");
     bool GetUploadId(std::string& upload_id);
     int GetIAMCredentials(void);
 
@@ -411,8 +416,9 @@ class S3fsCurl
     static bool SetContentMd5(bool flag);
     static bool SetVerbose(bool flag);
     static bool GetVerbose(void) { return S3fsCurl::is_verbose; }
-    static bool GetAccessKey(std::string& AccessKeyId, std::string& SecretAccessKey);
     static bool SetAccessKey(const char* AccessKeyId, const char* SecretAccessKey);
+    static bool GetAccessKeyAndToken(std::string&AccessKeyId, std::string&SecretAccessKey,std::string&AWSAccessToken);
+    static bool SetAccessKeyAndToken(const char* AccessKeyId, const char* SecretAccessKey,const char* AWSAccessToken);
     static bool IsSetAccessKeyID(void){
                   return (0 < S3fsCurl::AWSAccessKeyId.size());
                 }
@@ -461,7 +467,7 @@ class S3fsCurl
     int PutRequest(const char* tpath, headers_t& meta, int fd); 
     int PreGetObjectRequest(const char* tpath, int fd, off_t start, ssize_t size, sse_type_t ssetype, std::string& ssevalue);
     int GetObjectRequest(const char* tpath, int fd, off_t start = -1, ssize_t size = -1);
-    int CheckBucket(void);
+    int CheckBucket(const std::string& ak = "", const std::string& sk = "", const std::string& token = "");
     int ListBucketRequest(const char* tpath, const char* query);
     int PreMultipartPostRequest(const char* tpath, headers_t& meta, std::string& upload_id, bool is_copy);
     int CompleteMultipartPostRequest(const char* tpath, std::string& upload_id, etaglist_t& parts);

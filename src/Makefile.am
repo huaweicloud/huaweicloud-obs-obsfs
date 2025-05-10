@@ -26,34 +26,10 @@ endif
 
 obsfs_SOURCES = s3fs.h curl.cpp curl.h cache.cpp cache.h string_util.cpp string_util.h s3fs_util.cpp s3fs_util.h fdcache.cpp fdcache.h \
      readdir_marker_map.h readdir_marker_map.cpp common_auth.cpp s3fs_auth.h addhead.cpp addhead.h hws_index_cache.h hws_index_cache.cpp common.h\
-     hws_s3fs.cpp hws_s3fs_statis_api.h hws_s3fs_statis_api.cpp hws_fd_cache.cpp hws_fd_cache.h \
-     crc32c.cpp crc32c.h hws_configure.cpp hws_configure.h obsfs_log.cpp obsfs_log.h
+     hws_s3fs.cpp hws_s3fs_statis_api.h hws_s3fs_statis_api.cpp hws_fd_cache.cpp hws_fd_cache.h\
+     crc32c.cpp crc32c.h hws_configure.cpp hws_configure.h obsfs_log.cpp obsfs_log.h hws_fs_util.h hws_fs_util.cpp hws_cipher_key_check.h hws_cipher_key_check.cpp
 if USE_SSL_OPENSSL
   obsfs_SOURCES += openssl_auth.cpp
 endif
-if USE_SSL_GNUTLS
-  obsfs_SOURCES += gnutls_auth.cpp
-endif
-if USE_SSL_NSS
-  obsfs_SOURCES += nss_auth.cpp
-endif
 
 obsfs_LDADD = $(DEPS_LIBS)
-
-#noinst_PROGRAMS = test_string_util hws_fd_cache_test readdir_marker_map_test
-
-test_string_util_SOURCES = string_util.cpp test_string_util.cpp test_util.h
-
-hws_fd_cache_test_LDFLAGS = -pthread
-
-hws_fd_cache_test_CXXFLAGS = -DHWS_FD_CACHE_TEST
-
-hws_fd_cache_test_SOURCES = hws_fd_cache_test.cpp hws_fd_cache_test.h hws_fd_cache.cpp hws_fd_cache.h common.h gtest-all.cc gtest.h  crc32c.cpp crc32c.h obsfs_log.cpp obsfs_log.h
-
-readdir_marker_map_test_LDFLAGS = -pthread
-
-readdir_marker_map_test_CXXFLAGS = -DREADDIR_MARKER_MAP_TEST
-
-readdir_marker_map_test_SOURCES = readdir_marker_map.cpp readdir_marker_map.h readdir_marker_map_test.cpp common.h gtest-all.cc gtest.h obsfs_log.cpp obsfs_log.h
-
-TESTS = test_string_util hws_fd_cache_test readdir_marker_map_test

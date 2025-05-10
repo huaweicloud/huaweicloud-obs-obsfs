@@ -84,7 +84,7 @@ static pthread_mutex_t* s3fs_crypt_mutex = NULL;
 static void s3fs_crypt_mutex_lock(int mode, int pos, const char* file, int line)
 {
   if(s3fs_crypt_mutex){
-    if(mode & CRYPTO_LOCK){
+    if(static_cast<unsigned int>(mode) & CRYPTO_LOCK){
       pthread_mutex_lock(&s3fs_crypt_mutex[pos]);
     }else{
       pthread_mutex_unlock(&s3fs_crypt_mutex[pos]);
@@ -114,7 +114,7 @@ static struct CRYPTO_dynlock_value* s3fs_dyn_crypt_mutex(const char* file, int l
 static void s3fs_dyn_crypt_mutex_lock(int mode, struct CRYPTO_dynlock_value* dyndata, const char* file, int line)
 {
   if(dyndata){
-    if(mode & CRYPTO_LOCK){
+    if(static_cast<unsigned int>(mode) & CRYPTO_LOCK){
       pthread_mutex_lock(&(dyndata->dyn_mutex));
     }else{
       pthread_mutex_unlock(&(dyndata->dyn_mutex));
@@ -336,7 +336,7 @@ unsigned char* s3fs_sha256hexsum_hws_obs(const char* buf, off_t start, size_t si
   unsigned char* result;
 
   if (0 >= size || 0 > start){
-    S3FS_PRN_DBG("[buf=%s],[start=%jd],[size=%lu]", buf, (intmax_t)start, size);
+    S3FS_PRN_DBG("[start=%jd],[size=%lu]", (intmax_t)start, size);
     return NULL;
   }
 

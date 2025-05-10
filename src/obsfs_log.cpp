@@ -18,7 +18,9 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <limits.h>
 #include "obsfs_log.h"
+#include "hws_fs_util.h"
 
 
 #ifdef __cplusplus
@@ -63,7 +65,7 @@ bool                g_log_service_enable_flag      = FALSE;
 uint64_t            g_throw_log_count              = 0;
 uint32_t            g_log_flush_cnt                = 0;
 uint64_t            g_fileSizeByHandle = 0;
-uint64_t           g_process_id = 0;
+int                 g_process_id = 0;
 
 // info log support multiple instances
 std::atomic<uint32_t> g_instance_num{0};
@@ -202,7 +204,7 @@ void LogToBuf(
     char*           p           = nullptr;
     char*           limit       = nullptr;
     uint64_t        len         = 0;
-    const uint64_t  thread_id   = gettid();
+    const int       thread_id   = gettid();
     char            buffer[TEMP_ARRAY_LEN];
     char            timeZone[8];
 
@@ -219,7 +221,7 @@ void LogToBuf(
     localtime_r(&seconds, &t);
     strftime(timeZone, sizeof(timeZone), "%z", &t);
     p += snprintf(p, limit - p,
-                "[%04d-%02d-%02d %02d:%02d:%02d.%06d%s][%llu][%s][%s,%s,%u] ",
+                "[%04d-%02d-%02d %02d:%02d:%02d.%06d%s][%d][%s][%s,%s,%u] ",
                 t.tm_year + 1900,
                 t.tm_mon + 1,
                 t.tm_mday,
@@ -228,7 +230,7 @@ void LogToBuf(
                 t.tm_sec,
                 static_cast<int>(now_tv.tv_usec),   //lint !e26
                 timeZone,
-                (long long unsigned int)thread_id,
+                thread_id,
                 g_sLogLevel[log_level],
                 log_file_name,
                 log_func_name,
@@ -258,7 +260,7 @@ void LogToBuf(
     }
     len = p - base;
 
-    g_log_mutex.lock();
+    std::lock_guard<std::mutex> lock(g_log_mutex);
     if (E_PING == g_write_buf)
     {
         if (NeedSwitchBuf(len, g_ping_buf))
@@ -266,7 +268,6 @@ void LogToBuf(
             if (NeedSwitchBuf(len, g_pong_buf))
             {
                 g_throw_log_count++;
-                g_log_mutex.unlock();
                 return;
             }
 
@@ -287,7 +288,6 @@ void LogToBuf(
             if (NeedSwitchBuf(len, g_ping_buf))
             {
                 g_throw_log_count++;
-                g_log_mutex.unlock();
                 return;
             }
 
@@ -301,7 +301,6 @@ void LogToBuf(
             g_pong_buf.offset = g_pong_buf.offset + len;
         }
     }
-    g_log_mutex.unlock();
 
     return;
 }
@@ -327,13 +326,22 @@ void OpenLogFile(void)
     result = access((const char*)(index_log_file_path.c_str()), F_OK);
     if(0 != result)
     {
-         if (0 != mkdir((const char*)(index_log_file_path.c_str()), 0750)) {
-           return ;
-        }
+         mode_t old_umask = umask(0);
+         if (0 != mkdir((const char*)(index_log_file_path.c_str()), 0733)) {
+             umask(old_umask);
+             return ;
+         }
+         umask(old_umask);
     }
 
     umask(S_IXOTH);
-    g_log_file = open((const char*)(index_log_file_name.c_str()), O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+
+    char resolved_path[PATH_MAX];
+    if(!verifyPath(index_log_file_name.c_str(), resolved_path, false)) {
+        return;
+    }
+
+    g_log_file = open((const char*)resolved_path, O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
 
     return;
 }
@@ -371,7 +379,13 @@ void RenameLogFile()
    IndexSnprintf(new_name, sizeof(new_name), (index_log_file_name.length() + FORMAT_TIME_STR_LEN + 1), "%s.%s", index_log_file_name.c_str(), format_time_str);
    (void)rename((const char*)(index_log_file_name.c_str()), new_name);
    umask(S_IXOTH);
-   g_log_file = open((const char*)(index_log_file_name.c_str()), O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
+
+    char resolved_path[PATH_MAX];
+    if(!verifyPath(index_log_file_name.c_str(), resolved_path, false)) {
+        return;
+    }
+
+   g_log_file = open((const char*)resolved_path, O_RDWR | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP);
 }
 
 /*****************************************************************************
@@ -402,17 +416,21 @@ uint64_t GetFileSize(const char *path)
     }
     else
     {
-        fileSize = statbuff.st_size;
+        fileSize = static_cast<uint64_t>(statbuff.st_size);
     }
 
     if (-1 != g_log_file && fstat(g_log_file,&statbuff) >= 0)
     {
-        g_fileSizeByHandle = statbuff.st_size;
+        g_fileSizeByHandle = (uint64_t)(statbuff.st_size);
         if (g_fileSizeByHandle > (uint64_t)MAX_LOG_SIZE * 10)
         {
-            /*if current file size larger than 5 GB£¬change file handle*/
+            /*if current file size larger than 5 GB,change file handle*/
             close(g_log_file);
-            log_file_fd = open((const char*)(index_log_file_name.c_str()), O_RDWR | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP);
+            char resolved_path[PATH_MAX];
+            if(!verifyPath(index_log_file_name.c_str(), resolved_path, true)) {
+                return 0;
+            }
+            log_file_fd = open((const char*)resolved_path, O_RDWR | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP);
             if (log_file_fd > 0)
             {
                 g_log_file = log_file_fd;
@@ -522,7 +540,7 @@ int32_t WriteCachetoDisk(uint32_t& time_count)
 *****************************************************************************/
 void *LogFlushThread(void *junk)
 {
-    uint32_t    result      = RET_OK;
+    int32_t    result      = RET_OK;
     uint32_t    time_count  = 0;
 
     g_log_flush_cnt++;
@@ -536,29 +554,30 @@ void *LogFlushThread(void *junk)
 
         time_count++;
         g_log_flush_cnt++;
-        g_log_mutex.lock();
-        if (INDEX_CONDITION_TRUE(E_PING == g_write_buf && 0 != g_pong_buf.offset))
         {
-            CopyCacheToWriteDiskBuf(g_pong_buf,g_write_disk_buf);
-        }
-        else if (INDEX_CONDITION_TRUE(E_PONG == g_write_buf && 0 != g_ping_buf.offset))
-        {
-            CopyCacheToWriteDiskBuf(g_ping_buf,g_write_disk_buf);
-        }
-        else if (INDEX_CONDITION_TRUE(FLUSH_TIME <= time_count * FLUSH_SLEEP_TIME))
-        {
-            if (INDEX_CONDITION_TRUE(E_PING == g_write_buf && 0 != g_ping_buf.offset))
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            if (INDEX_CONDITION_TRUE(E_PING == g_write_buf && 0 != g_pong_buf.offset))
             {
-                g_write_buf = E_PONG;
-                CopyCacheToWriteDiskBuf(g_ping_buf,g_write_disk_buf);
-            }
-            else if (INDEX_CONDITION_TRUE(E_PONG == g_write_buf && 0 != g_pong_buf.offset))
-            {
-                g_write_buf = E_PING;
                 CopyCacheToWriteDiskBuf(g_pong_buf,g_write_disk_buf);
             }
+            else if (INDEX_CONDITION_TRUE(E_PONG == g_write_buf && 0 != g_ping_buf.offset))
+            {
+                CopyCacheToWriteDiskBuf(g_ping_buf,g_write_disk_buf);
+            }
+            else if (INDEX_CONDITION_TRUE(FLUSH_TIME <= time_count * FLUSH_SLEEP_TIME))
+            {
+                if (INDEX_CONDITION_TRUE(E_PING == g_write_buf && 0 != g_ping_buf.offset))
+                {
+                    g_write_buf = E_PONG;
+                    CopyCacheToWriteDiskBuf(g_ping_buf,g_write_disk_buf);
+                }
+                else if (INDEX_CONDITION_TRUE(E_PONG == g_write_buf && 0 != g_pong_buf.offset))
+                {
+                    g_write_buf = E_PING;
+                    CopyCacheToWriteDiskBuf(g_pong_buf,g_write_disk_buf);
+                }
+            }
         }
-        g_log_mutex.unlock();
 
         result = WriteCachetoDisk(time_count);
         if (RET_OK != result)
@@ -607,7 +626,7 @@ void DisableLogService(void)
 void DisableLogService__(void)
 {
     uint32_t loop = 0;
-    uint32_t len  = 0;
+    ssize_t len  = 0;
     int32_t  iRet = 0;
     g_should_stop_flag = TRUE;//exit flush thread
 
@@ -756,8 +775,8 @@ void IndexSetLogFileName(const std::string& log_file_path, const std::string& lo
 {
     char    process_id_str[LOG_NEW_NAME_LEN]           = {0};
 
-    g_process_id = (long long )getpid();
-    snprintf(process_id_str, sizeof(process_id_str), "%ld",g_process_id);
+    g_process_id = getpid();
+    snprintf(process_id_str, sizeof(process_id_str), "%d",g_process_id);
     /* BEGIN: Modified for fix log lost, 2017/6/8 */
     index_log_file_path = log_file_path;
     index_log_file_name = index_log_file_path + log_file_name + process_id_str;
@@ -856,104 +875,26 @@ void ManualFlushLog(void)
         return;
     }
 
-    g_log_mutex.lock();
-
-    if (0 != g_ping_buf.offset)
     {
-        (void)write(g_log_file, g_ping_buf.start, g_ping_buf.offset);
-        CleanLogBuf(&g_ping_buf);
-    }
+        std::lock_guard <std::mutex> lock(g_log_mutex);
 
-    if (0 != g_pong_buf.offset)
-    {
-        (void)write(g_log_file, g_pong_buf.start, g_pong_buf.offset);
-        CleanLogBuf(&g_pong_buf);
+        if (0 != g_ping_buf.offset)
+        {
+            (void)write(g_log_file, g_ping_buf.start, g_ping_buf.offset);
+            CleanLogBuf(&g_ping_buf);
+        }
+
+        if (0 != g_pong_buf.offset)
+        {
+            (void)write(g_log_file, g_pong_buf.start, g_pong_buf.offset);
+            CleanLogBuf(&g_pong_buf);
+        }
     }
-    g_log_mutex.unlock();
 
     (void)fsync(g_log_file);
 
     return;
 }
-//convert byte to hex
-void IndexByte2HexAsic(char byte1, char hexbuf[3])
-{
-    unsigned char byte = (unsigned char)byte1;
-    unsigned char high4bit = byte >> 4, low4bit = (byte & 0x0F);
-    hexbuf[0] = (high4bit <= 9) ? (high4bit + 0x30) : (high4bit + 0x61-0xa);
-    hexbuf[1] = (low4bit <= 9) ? (low4bit + 0x30) : (low4bit + 0x61-0xa);
-    hexbuf[2] = 0;
-}
-//binary data 2 hexstring
-std::string IndexData2HexString(const char *pdata, int size)
-{
-    std::string  hexstring;
-    char  hexbuf[3] = {0};
-    int   i = 0;
-
-    while(size > 0)
-    {
-        IndexByte2HexAsic(pdata[i], hexbuf);
-        hexstring.append(hexbuf);
-        size--;
-        i++;
-    }
-    return hexstring;
-}
-
-// Dump data to log with hex format
-void IndexDataHexDump(const char *buf, int len) {
-    int i = 0, j = 0, k = 0;
-    int max_size = 16*1024*1024; // 16MB
-    char *binStr = NULL;
-
-    if (0 >= len || len > max_size) {
-        IndexCommLogWarn("", "bson length is invalid for dump! len(%d)max(%d)",
-            len, max_size);
-        return;
-    }
-
-    binStr = (char*)malloc(len);
-    IndexMemZero(binStr,len);
-
-    if (NULL == binStr) {
-        IndexCommLogWarn("", "malloc fail! size(%d)", len);
-        return;
-    }
-
-    for (i=0; i<len; i++) {
-        if (0==(i%16)) {
-            IndexSprintf(binStr, len, "%08x -", (unsigned int)i);
-            IndexSprintf(binStr, len, "%s %02x", binStr,(unsigned char)buf[i]);
-        } else if (15 == (i%16)) {
-            IndexSprintf(binStr, len, "%s %02x", binStr,(unsigned char)buf[i]);
-            IndexSprintf(binStr, len, "%s  ", binStr);
-            for (j=i-15; j<=i; j++) {
-                IndexSprintf(binStr, len, "%s%c", binStr, ('!'<buf[j] && buf[j]<='~') ? buf[j] : '.');
-            }
-            IndexCommLogWarn("", "%s", binStr);
-        } else {
-            IndexSprintf(binStr, len, "%s %02x", binStr, (unsigned char)buf[i]);
-        }
-    }
-
-    if (0 != (i%16)) {
-        k = 16 - (i%16);
-        for (j=0; j<k; j++) {
-            IndexSprintf(binStr, len, "%s   ", binStr);
-        }
-        IndexSprintf(binStr, len, "%s  ", binStr);
-        k = 16-k;
-        for (j=i-k; j<i;j ++) {
-            IndexSprintf(binStr, len, "%s%c", binStr, ('!'<buf[j] && buf[j]<='~') ? buf[j] : '.');
-        }
-        IndexCommLogWarn("", "%s", binStr);
-    }
-
-    IndexMemFree(binStr);
-    return;
-}
-
 
 #ifdef __cplusplus
 #if __cplusplus

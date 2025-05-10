@@ -111,8 +111,6 @@ extern void __IndexCrashIf(
     const uint32_t     log_line,
     const char*        pszFormat, ...);
 
-extern std::string IndexData2HexString(const char *pdata, int size);
-extern void IndexDataHexDump(const char *buf, int len);
 extern uint32_t g_index_log_level; //to avoid naming confict with third party
 
 
