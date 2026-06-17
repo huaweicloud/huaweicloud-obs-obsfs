@@ -336,6 +336,16 @@ bool StatCache::IsNoObjectCache(string& key, bool overcheck)
   return false;
 }
 
+// Note: the unconditional DelStatHasLock on a found key below cannot clobber
+// an "in-progress" entry, because production code only ever calls
+// AddStat(..., no_truncate=false). The notruncate>0 counter is only touched
+// by ChangeNoTruncateFlag, which is unused outside of cache_test.cpp.
+// Callers that populate the cache after a fresh HEAD/PUT (e.g. the symlink
+// and getattr paths) can safely AddStat(..., false) without worrying about
+// overwriting a guarded entry. DelStatIfTruncatable's 1-second grace window
+// (DEL_TRUNCATABLE_MIN_AGE_SEC) protects freshly-added entries from being
+// evicted by readdir's stale-cleanup before they're visible in ListBucket.
+//
 bool StatCache::AddStatHasLock(std::string& key, headers_t& meta, bool forcedir, bool no_truncate)
 {
   bool found = stat_cache.end() != stat_cache.find(key);
@@ -422,6 +432,13 @@ bool StatCache::AddNoObjectCache(string& key)
   return true;
 }
 
+// Note: production code does not call this function — all setters use
+// no_truncate=false. It survives as a test hook (cache_test.cpp) and as a
+// future extension point. If a future change starts using notruncate=true
+// for production entries, also revisit AddStatHasLock — its unconditional
+// DelStatHasLock is only safe today because no production caller creates
+// notruncate>0 entries.
+//
 void StatCache::ChangeNoTruncateFlag(std::string key, bool no_truncate)
 {
   const std::lock_guard<std::mutex> lock(StatCache::stat_cache_lock);

@@ -4079,6 +4079,348 @@ TEST_F(S3fsOpsMockTest, ReadS3_ValidFd) {
 }
 
 // =================================================================
+// symlink + readdir StatCache pollution fix
+//   - s3fs_symlink_s3 writes AddStat after PUT
+//   - s3fs_getattr_s3 writes AddStat after HEAD
+//   - s3fs_readdir_s3 skips synthesized AddStat AND passes nullptr to
+//     filler for zero-byte / size-ambiguous entries
+// =================================================================
+
+// Filler that records (name, had_stat) for each entry. Used by the readdir
+// tests to verify that 0-byte entries are passed nullptr (so the kernel
+// doesn't cache a fake stat) and non-0-byte entries still get a stat (so
+// the readdir fast-path is preserved).
+struct FillerCall {
+    std::string name;
+    bool had_stat;       // true if filler was called with non-null stbuf
+    mode_t reported_mode; // 0 if had_stat == false
+};
+static std::vector<FillerCall> g_filler_calls;
+
+static int recording_filler(void* buf, const char* name, const struct stat* stbuf, off_t off) {
+    (void)buf; (void)off;
+    if(name){
+        FillerCall c;
+        c.name = name;
+        c.had_stat = (stbuf != nullptr);
+        c.reported_mode = stbuf ? stbuf->st_mode : 0;
+        g_filler_calls.push_back(c);
+    }
+    return 0;
+}
+
+static const FillerCall* find_filler_call(const std::string& name){
+    for(const auto& c : g_filler_calls){
+        if(c.name == name) return &c;
+    }
+    return nullptr;
+}
+
+// ----- S1: s3fs_symlink_s3 PUT-then-AddStat ---------------------------------
+
+TEST_F(S3fsOpsMockTest, S1_Symlink_PutPopulatesStatCacheAsLNK) {
+    g_mock.put_result = 0;
+
+    EXPECT_EQ(0, s3fs_symlink_s3("/some/target", "/my/lnk"));
+
+    // S1 invariant: after a successful PUT, the symlink key is in StatCache
+    // and reports as a symlink (not REG).
+    std::string key("/my/lnk");
+    struct stat st;
+    headers_t meta;
+    ASSERT_TRUE(StatCache::getStatCacheData()->GetStat(key, &st, &meta, true));
+    EXPECT_TRUE(S_ISLNK(st.st_mode))
+        << "StatCache must reflect symlink mode after s3fs_symlink_s3 (got mode "
+        << std::oct << st.st_mode << ")";
+    EXPECT_NE(meta.end(), meta.find("x-amz-meta-symlink-target"))
+        << "Symlink target meta should be persisted in StatCache";
+}
+
+TEST_F(S3fsOpsMockTest, S1_Symlink_PutFailedDoesNotPopulateCache) {
+    g_mock.put_result = -EIO;
+
+    EXPECT_EQ(-EIO, s3fs_symlink_s3("/some/target", "/my/lnk_fail"));
+
+    // PUT failed → must NOT have cache entry (no half-baked state).
+    std::string key("/my/lnk_fail");
+    struct stat st;
+    EXPECT_FALSE(StatCache::getStatCacheData()->GetStat(key, &st))
+        << "PUT failure must not leave a StatCache entry";
+}
+
+// ----- S2: s3fs_getattr_s3 HEAD-then-AddStat --------------------------------
+
+TEST_F(S3fsOpsMockTest, S2_Getattr_HeadSuccessPopulatesStatCache) {
+    g_mock.head_result = 0;
+    g_mock.head_meta["Content-Length"] = "1234";
+    g_mock.head_meta["Content-Type"] = "application/octet-stream";
+    g_mock.head_meta["x-hws-obs-meta-mode"] = "33188";  // S_IFREG|0644
+
+    struct stat stbuf;
+    EXPECT_EQ(0, s3fs_getattr_s3("/some/file.txt", &stbuf));
+
+    // S2 invariant: HEAD success → StatCache hit on subsequent lookup.
+    std::string key("/some/file.txt");
+    struct stat cached;
+    EXPECT_TRUE(StatCache::getStatCacheData()->GetStat(key, &cached));
+    EXPECT_TRUE(S_ISREG(cached.st_mode));
+    EXPECT_EQ(1234, cached.st_size);
+}
+
+TEST_F(S3fsOpsMockTest, S2_Getattr_SymlinkHeadCachesAsLNK) {
+    g_mock.head_result = 0;
+    g_mock.head_meta["Content-Type"] = "application/symlink";
+    g_mock.head_meta["x-amz-meta-symlink-target"] = "/target/path";
+    g_mock.head_meta["x-hws-obs-meta-mode"] = "41471";  // S_IFLNK | 0777
+
+    struct stat stbuf;
+    EXPECT_EQ(0, s3fs_getattr_s3("/the/lnk", &stbuf));
+    EXPECT_TRUE(S_ISLNK(stbuf.st_mode));
+
+    // S2 + symlink path: cache must hold S_IFLNK (this is the user-bug class).
+    std::string key("/the/lnk");
+    struct stat cached;
+    headers_t meta;
+    ASSERT_TRUE(StatCache::getStatCacheData()->GetStat(key, &cached, &meta));
+    EXPECT_TRUE(S_ISLNK(cached.st_mode));
+    EXPECT_NE(meta.end(), meta.find("x-amz-meta-symlink-target"));
+}
+
+TEST_F(S3fsOpsMockTest, S2_Getattr_SecondCallHitsCacheNoExtraHead) {
+    g_mock.head_result = 0;
+    g_mock.head_meta["Content-Length"] = "10";
+    g_mock.head_meta["Content-Type"] = "application/octet-stream";
+    g_mock.head_meta["x-hws-obs-meta-mode"] = "33188";
+
+    struct stat stbuf;
+    EXPECT_EQ(0, s3fs_getattr_s3("/cached/file", &stbuf));
+    int first_count = g_mock.head_call_count;
+
+    // Second call must HIT cache → no extra HEAD.
+    EXPECT_EQ(0, s3fs_getattr_s3("/cached/file", &stbuf));
+    EXPECT_EQ(first_count, g_mock.head_call_count)
+        << "S2's AddStat should let subsequent getattr serve from cache "
+        << "(HEAD called " << g_mock.head_call_count << " times, expected "
+        << first_count << ")";
+}
+
+TEST_F(S3fsOpsMockTest, S2_Getattr_HeadFailureDoesNotPopulatePositiveCache) {
+    g_mock.head_result = -ENOENT;
+
+    struct stat stbuf;
+    EXPECT_EQ(-ENOENT, s3fs_getattr_s3("/no/such", &stbuf));
+
+    // Negative-cache path is separate; the positive cache must remain empty.
+    std::string key("/no/such");
+    struct stat cached;
+    EXPECT_FALSE(StatCache::getStatCacheData()->GetStat(key, &cached))
+        << "ENOENT path must not write a positive StatCache entry";
+}
+
+// ----- S3: readdir 0-byte branch --------------------------------------------
+
+TEST_F(S3fsOpsMockTest, S3_Readdir_ZeroByteEntryFillerGetsNullptr) {
+    g_mock.list_body_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult>"
+        "<IsTruncated>false</IsTruncated>"
+        "<Contents><Key>dir/lnk</Key><Size>0</Size></Contents>"
+        "<Contents><Key>dir/big.bin</Key><Size>4096</Size></Contents>"
+        "</ListBucketResult>";
+
+    g_filler_calls.clear();
+    EXPECT_EQ(0, s3fs_readdir_s3("/dir", NULL, recording_filler, 0, NULL));
+
+    const FillerCall* lnk = find_filler_call("lnk");
+    ASSERT_NE(nullptr, lnk);
+    EXPECT_FALSE(lnk->had_stat)
+        << "S3 invariant: 0-byte entry must be filled with nullptr stbuf "
+        << "so kernel readdirplus does not cache a synthesized REG mode";
+
+    const FillerCall* big = find_filler_call("big.bin");
+    ASSERT_NE(nullptr, big);
+    EXPECT_TRUE(big->had_stat)
+        << "Non-0-byte entry must still get filler stbuf (readdir fast path)";
+    EXPECT_TRUE(S_ISREG(big->reported_mode));
+}
+
+TEST_F(S3fsOpsMockTest, S3_Readdir_ZeroByteSkipsAddStat) {
+    g_mock.list_body_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult>"
+        "<IsTruncated>false</IsTruncated>"
+        "<Contents><Key>dir/lnk</Key><Size>0</Size></Contents>"
+        "<Contents><Key>dir/big.bin</Key><Size>4096</Size></Contents>"
+        "</ListBucketResult>";
+
+    g_filler_calls.clear();
+    EXPECT_EQ(0, s3fs_readdir_s3("/dir", NULL, recording_filler, 0, NULL));
+
+    // S3 obsfs-cache side: 0-byte entry must NOT be in StatCache (so the
+    // next getattr does a real HEAD and gets the real mode).
+    std::string lnk_key("/dir/lnk");
+    struct stat dummy;
+    EXPECT_FALSE(StatCache::getStatCacheData()->GetStat(lnk_key, &dummy))
+        << "S3 invariant: 0-byte entry must not be AddStat'd from readdir";
+
+    // Non-0-byte entry's synthesized AddStat is preserved (readdir fast path).
+    std::string big_key("/dir/big.bin");
+    EXPECT_TRUE(StatCache::getStatCacheData()->GetStat(big_key, &dummy))
+        << "Non-0-byte entry must still be AddStat'd (readdir fast path preserved)";
+}
+
+TEST_F(S3fsOpsMockTest, S3_Readdir_AllZeroByteAllSkipped) {
+    g_mock.list_body_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult>"
+        "<IsTruncated>false</IsTruncated>"
+        "<Contents><Key>dir/a</Key><Size>0</Size></Contents>"
+        "<Contents><Key>dir/b</Key><Size>0</Size></Contents>"
+        "<Contents><Key>dir/c</Key><Size>0</Size></Contents>"
+        "</ListBucketResult>";
+
+    g_filler_calls.clear();
+    EXPECT_EQ(0, s3fs_readdir_s3("/dir", NULL, recording_filler, 0, NULL));
+
+    // All three filler calls must have null stbuf.
+    for(const char* name : {"a", "b", "c"}){
+        const FillerCall* fc = find_filler_call(name);
+        ASSERT_NE(nullptr, fc) << "expected filler call for " << name;
+        EXPECT_FALSE(fc->had_stat)
+            << "filler('" << name << "') should pass nullptr stbuf";
+    }
+    // None should be in StatCache.
+    for(const char* k : {"/dir/a", "/dir/b", "/dir/c"}){
+        std::string key(k);
+        struct stat dummy;
+        EXPECT_FALSE(StatCache::getStatCacheData()->GetStat(key, &dummy))
+            << k << " should not be AddStat'd by readdir";
+    }
+}
+
+TEST_F(S3fsOpsMockTest, S2_Getattr_DoesNotOverwriteExistingCacheEntry) {
+    // Pre-seed StatCache with a "fresh" entry (e.g. just-written by parallel
+    // create / chmod). Then drive getattr → HEAD returns DIFFERENT meta.
+    // S2's probe-then-AddStat guard must NOT overwrite the pre-seeded entry.
+    headers_t fresh_meta;
+    fresh_meta["Content-Length"] = "999";
+    fresh_meta["Content-Type"] = "application/octet-stream";
+    fresh_meta["x-hws-obs-meta-mode"] = "33152";  // S_IFREG | 0600 (distinct)
+    fresh_meta[hws_obs_meta_mtime] = "1900000000";
+    std::string preseed_key("/contended/file");
+    StatCache::getStatCacheData()->AddStat(preseed_key, fresh_meta, false, false);
+
+    // Mock HEAD returns an older/different snapshot.
+    g_mock.head_result = 0;
+    g_mock.head_meta.clear();
+    g_mock.head_meta["Content-Length"] = "100";
+    g_mock.head_meta["Content-Type"] = "application/octet-stream";
+    g_mock.head_meta["x-hws-obs-meta-mode"] = "33188";  // S_IFREG | 0644 (different)
+    g_mock.head_meta[hws_obs_meta_mtime] = "1700000000";
+
+    struct stat stbuf;
+    EXPECT_EQ(0, s3fs_getattr_s3("/contended/file", &stbuf));
+
+    // Cache should still hold the pre-seeded entry, not the HEAD snapshot.
+    // We check via st_size and st_mode (cache.cpp AddStatHasLock persists
+    // headers selectively into ent->meta but always derives stbuf from
+    // convert_header_to_stat — so st_mode/st_size are the load-bearing
+    // assertions, not the meta map contents).
+    struct stat cached;
+    ASSERT_TRUE(StatCache::getStatCacheData()->GetStat(preseed_key, &cached));
+    EXPECT_EQ(999, cached.st_size)
+        << "S2 must not overwrite an existing StatCache entry (parallel-writer guard).";
+    EXPECT_EQ((mode_t)(S_IFREG | 0600), cached.st_mode & 0777777)
+        << "Pre-seeded mode (0600) must survive S2's AddStat.";
+}
+
+TEST_F(S3fsOpsMockTest, S2_Getattr_ModeHeaderParsesLNKWithoutSymlinkContentType) {
+    // Independent verification of the mode-header parsing path: even when the
+    // Content-Type does NOT indicate symlink, the `x-hws-obs-meta-mode` header
+    // with S_IFLNK bits should still cause stbuf and cache to report LNK.
+    g_mock.head_result = 0;
+    g_mock.head_meta["Content-Length"] = "11";
+    g_mock.head_meta["Content-Type"] = "application/octet-stream";  // NOT application/symlink
+    g_mock.head_meta["x-amz-meta-symlink-target"] = "/some/where";
+    g_mock.head_meta["x-hws-obs-meta-mode"] = "41471";  // S_IFLNK | 0777
+
+    struct stat stbuf;
+    EXPECT_EQ(0, s3fs_getattr_s3("/the/mode_lnk", &stbuf));
+    EXPECT_TRUE(S_ISLNK(stbuf.st_mode))
+        << "Mode-header bits should mark this as LNK regardless of Content-Type.";
+
+    std::string key("/the/mode_lnk");
+    struct stat cached;
+    ASSERT_TRUE(StatCache::getStatCacheData()->GetStat(key, &cached));
+    EXPECT_TRUE(S_ISLNK(cached.st_mode));
+}
+
+TEST_F(S3fsOpsMockTest, S3_Readdir_TruncatedMixedZeroAndNonZeroAcrossPages) {
+    // Multi-page readdir, each page mixes 0-byte and non-0-byte. Verifies the
+    // is_zero_byte branch holds per-iteration and per-page (no state leak
+    // across the pagination loop).
+    g_mock.list_xml_queue.push_back(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult>"
+        "<IsTruncated>true</IsTruncated>"
+        "<NextMarker>dir/p1_last</NextMarker>"
+        "<Contents><Key>dir/p1_zero</Key><Size>0</Size></Contents>"
+        "<Contents><Key>dir/p1_big</Key><Size>100</Size></Contents>"
+        "<Contents><Key>dir/p1_last</Key><Size>50</Size></Contents>"
+        "</ListBucketResult>");
+    g_mock.list_xml_queue.push_back(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult>"
+        "<IsTruncated>false</IsTruncated>"
+        "<Contents><Key>dir/p2_big</Key><Size>200</Size></Contents>"
+        "<Contents><Key>dir/p2_zero</Key><Size>0</Size></Contents>"
+        "</ListBucketResult>");
+
+    g_filler_calls.clear();
+    EXPECT_EQ(0, s3fs_readdir_s3("/dir", NULL, recording_filler, 0, NULL));
+
+    // Cross-page assertion: zero-byte entries on either page got nullptr,
+    // non-zero entries on either page got stat.
+    for(const char* zero_name : {"p1_zero", "p2_zero"}){
+        const FillerCall* fc = find_filler_call(zero_name);
+        ASSERT_NE(nullptr, fc) << "missing filler call for " << zero_name;
+        EXPECT_FALSE(fc->had_stat) << zero_name << " (0-byte) should get nullptr stbuf";
+        std::string key = std::string("/dir/") + zero_name;
+        struct stat dummy;
+        EXPECT_FALSE(StatCache::getStatCacheData()->GetStat(key, &dummy))
+            << zero_name << " (0-byte) should not be AddStat'd";
+    }
+    for(const char* nz_name : {"p1_big", "p1_last", "p2_big"}){
+        const FillerCall* fc = find_filler_call(nz_name);
+        ASSERT_NE(nullptr, fc) << "missing filler call for " << nz_name;
+        EXPECT_TRUE(fc->had_stat) << nz_name << " (non-0) should get &st stbuf";
+    }
+    EXPECT_EQ(2, g_mock.list_call_count);
+}
+
+TEST_F(S3fsOpsMockTest, S3_Readdir_DirMarkerStillAddStatd) {
+    // dir marker (trailing slash) goes through the CommonPrefixes/marker
+    // branch, NOT the file branch. S3's 0-byte logic only affects the file
+    // branch; dirs continue to AddStat as before.
+    g_mock.list_body_xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<ListBucketResult>"
+        "<IsTruncated>false</IsTruncated>"
+        "<Contents><Key>dir/sub/</Key><Size>0</Size></Contents>"
+        "</ListBucketResult>";
+
+    g_filler_calls.clear();
+    EXPECT_EQ(0, s3fs_readdir_s3("/dir", NULL, recording_filler, 0, NULL));
+
+    // The dir marker is rolled into a synthetic dir entry, filler gets
+    // a stat with S_IFDIR.
+    const FillerCall* sub = find_filler_call("sub");
+    ASSERT_NE(nullptr, sub);
+    EXPECT_TRUE(sub->had_stat);
+    EXPECT_TRUE(S_ISDIR(sub->reported_mode));
+}
+
+// =================================================================
 // main
 // =================================================================
 int main(int argc, char** argv) {

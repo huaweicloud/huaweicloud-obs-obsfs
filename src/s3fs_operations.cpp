@@ -1057,6 +1057,47 @@ int s3fs_getattr_s3(const char* path, struct stat* stbuf)
         }
     }
 
+    // Populate StatCache after a successful HEAD so subsequent
+    // getattr/readdir reuse the real meta instead of issuing another HEAD.
+    // Mirrors upstream s3fs-fuse's get_object_attribute() pattern: every
+    // read path that resolves an object writes the cache. Without this,
+    // readdir's metadata-synthesis fast-path would never see a real entry
+    // for objects only ever touched via getattr (e.g. symlinks created
+    // via FUSE ln -s, or any object uploaded by an external SDK), and
+    // would overwrite the truth with a synthesized S_IFREG|0640 stub.
+    //
+    // notruncate=false is safe (see cache.cpp comment).
+    //
+    // Probe-then-AddStat guard: between the earlier GetStat miss and this
+    // point there is a full HEAD round-trip (~100ms). A concurrent
+    // create/mkdir/chmod may have AddStat'd fresh meta in that window —
+    // we must not clobber it with an older HEAD snapshot. The implicit-
+    // directory probe path above also produces a synthesized stub for
+    // `meta`; if some other operation already populated real meta, we
+    // shouldn't overwrite it with the stub.
+    //
+    // GetStat and AddStat each acquire stat_cache_lock independently, so
+    // a small TOCTOU window remains between probe-miss and AddStat. This
+    // is benign:
+    //   - Two concurrent getattr readers will both write identical
+    //     payloads (same object → same HEAD result), last-writer-wins.
+    //   - If the racing writer was a setter (create/mkdir/chmod) that
+    //   - A racing setter that wrote fresher meta would be overwritten
+    //     once with an older HEAD snapshot; the next setter or cache
+    //     expiry refreshes it. The probe-guarded form still wins over
+    //     unconditional overwrite, which would clobber every concurrent
+    //     setter.
+    // Closing this window cleanly would need an atomic add-if-absent
+    // primitive in StatCache — left as a follow-up; not required for
+    // correctness.
+    {
+        struct stat probe_stat;
+        headers_t probe_meta;
+        if(!StatCache::getStatCacheData()->GetStat(cache_key, &probe_stat, &probe_meta, overcheck)){
+            StatCache::getStatCacheData()->AddStat(cache_key, meta, is_directory, false);
+        }
+    }
+
     return 0;
 }
 
@@ -1475,6 +1516,17 @@ int s3fs_symlink_s3(const char* from, const char* to) {
     if(0 != result){
         S3FS_PRN_ERR("failed to create symlink: %s -> %s (result=%d)", to, from, result);
         return result;
+    }
+
+    // Write the real meta into StatCache so a subsequent readdir's probe
+    // sees the entry and does NOT overwrite it with a synthesized
+    // S_IFREG/0640 stub. Without this, `ln -s a c` followed by any `ls`
+    // would poison the cache and the next `cd c` would return ENOTDIR.
+    // Same shape as s3fs_mkdir_s3's post-PUT AddStat. notruncate=false
+    // (see cache.cpp comment).
+    {
+        std::string to_key = to;
+        StatCache::getStatCacheData()->AddStat(to_key, meta, false, false);
     }
 
     S3FS_PRN_INFO("symlink created: %s -> %s", to, from);
@@ -2596,9 +2648,48 @@ int s3fs_readdir_s3(const char* path, void* buf, fuse_fill_dir_t filler, off_t o
                                 xmlXPathFreeObject(etag_xp);
                             }
 
-                            filler(buf, name.c_str(), &st, 0);
+                            // A 0-byte ListBucket entry could be a symlink,
+                            // a setuid-marked empty file, or any other non-REG
+                            // type — ListBucket alone cannot tell. If we
+                            // synthesize S_IFREG|0640 here and feed it to the
+                            // filler, both the obsfs StatCache and the kernel
+                            // readdirplus attr cache would lock in the wrong
+                            // mode (the obsfs entry sticks for ~stat_cache_expire
+                            // seconds; the kernel entry for attr_timeout). For
+                            // size==0 we surgically skip BOTH cache fills:
+                            //   - filler receives nullptr, so the kernel does
+                            //     not cache attrs for this entry; the next
+                            //     stat/lookup goes through getattr → HEAD.
+                            //   - the synthesized AddStat below is skipped,
+                            //     so the obsfs StatCache stays empty here;
+                            //     getattr will populate the real meta when
+                            //     someone actually accesses the object.
+                            // For size>0 entries the type is unambiguously
+                            // REG (object-bucket semantics), so the readdir
+                            // fast-path is preserved.
+                            //
+                            // Boundary: this heuristic is shaped for FUSE-
+                            // created symlinks (always 0-byte). An external
+                            // SDK that uploads a symlink-shaped object with
+                            // a non-zero body would fall through to the
+                            // size>0 branch and get a synthesized REG entry;
+                            // a later direct getattr will correct it. Such
+                            // uploads are outside the scope of this fix.
+                            //
+                            // "size_ambiguous" also covers the case where
+                            // ListBucket's <Size> element is missing or
+                            // unparseable — parsed_size stays at its 0 init
+                            // value and we conservatively skip the cache
+                            // fill rather than caching a possibly-wrong mode.
+                            const bool size_ambiguous = (parsed_size == 0);
+                            if(size_ambiguous){
+                                filler(buf, name.c_str(), nullptr, 0);
+                            }else{
+                                filler(buf, name.c_str(), &st, 0);
+                            }
                             listed_entries.insert(name);
-                            S3FS_PRN_DBG("readdir added file: %s", name.c_str());
+                            S3FS_PRN_DBG("readdir added file: %s (size=%lld, ambiguous=%d)",
+                                         name.c_str(), (long long)parsed_size, size_ambiguous ? 1 : 0);
 
                             // ISSUE2026051200001 M.1: synthesize complete meta and
                             // write to StatCache. Avoids the per-entry HEAD that
@@ -2628,7 +2719,9 @@ int s3fs_readdir_s3(const char* path, void* buf, fuse_fill_dir_t filler, off_t o
                             // when on, skip synthesized AddStat so the next getattr
                             // falls back to per-entry HEAD (recovers s3fs-fuse
                             // readdir_multi_head accuracy for custom uid/gid/mode).
-                            if(!accurate_readdir){
+                            // Also skip when size_ambiguous (see the comment
+                            // block above the filler call).
+                            if(!accurate_readdir && !size_ambiguous){
                                 std::string file_path;
                                 if(strcmp(path, "/") == 0){
                                     file_path = "/" + name;
