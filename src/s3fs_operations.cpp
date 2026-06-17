@@ -121,6 +121,74 @@ static bool is_truncated_s3ops(xmlDocPtr doc);
 static std::string get_next_marker_s3ops(xmlDocPtr doc);
 
 //
+// mount_prefix injection for ListBucket-based ops.
+// Object semantic only — file bucket uses inode-prefix routing in
+// list_bucket_hw_obs (hws_s3fs.cpp) and never goes through these helpers.
+//
+// Single-object ops (HEAD/GET/PUT/DELETE/Copy) prepend mount_prefix via
+// get_realpath() in s3fs_util.cpp; but ListBucketRequest's URL is at bucket
+// root, so the caller must inject mount_prefix into the "prefix=" query
+// itself. Returned <Key>/<Prefix> values also carry mount_prefix and need
+// stripping before they can be used as FUSE-relative paths.
+//
+// Normalization: mount_prefix is stored with leading '/' kept and trailing '/'
+// stripped (hws_s3fs.cpp:4187). Empty mount_prefix (root mount) must produce
+// byte-identical query/results to the pre-fix behavior.
+//
+static std::string build_object_list_prefix(const char* fuse_path)
+{
+    std::string result;
+    // mount_prefix is e.g. "/sub/path" or "" (root mount).
+    if(!mount_prefix.empty()){
+        // Strip leading '/' to form bucket-root-relative key prefix.
+        result = (mount_prefix[0] == '/') ? mount_prefix.substr(1) : mount_prefix;
+    }
+    if(fuse_path && 0 != strcmp(fuse_path, "/")){
+        if(!result.empty() && result.back() != '/'){
+            result += "/";
+        }
+        const char* tail = (fuse_path[0] == '/') ? fuse_path + 1 : fuse_path;
+        result += tail;
+    }
+    if(!result.empty() && result.back() != '/'){
+        result += "/";
+    }
+    return result;
+}
+
+// Strip the normalized mount_prefix from an S3-returned full key, leaving a
+// FUSE-relative path (with leading '/'). Empty mount_prefix is a no-op
+// (returns "/" + full_key).
+//
+// Protocol-violation contract: if the key does NOT start with mount_prefix,
+// return empty string and PRN_ERR. S3/OBS ListBucket with prefix=X must only
+// return keys starting with X — a violation means a buggy server or a
+// race we can't reason about. Callers MUST treat empty return as
+// "skip this entry, do not feed downstream". Returning a fabricated path
+// (older "/" + full_key fallback) risked silent corruption: rename_object_s3
+// would re-prepend mount_prefix and either 404 (best case) or copy/delete
+// the wrong object if names happened to overlap (worst case).
+static std::string strip_mount_prefix_from_key(const std::string& full_key)
+{
+    if(mount_prefix.empty()){
+        return std::string("/") + full_key;
+    }
+    // mount_prefix has leading '/' and no trailing '/' — bucket-root-relative
+    // form is mount_prefix.substr(1) plus a trailing '/'.
+    std::string mp_key = mount_prefix.substr(1);
+    if(!mp_key.empty() && mp_key.back() != '/'){
+        mp_key += "/";
+    }
+    if(full_key.compare(0, mp_key.size(), mp_key) == 0){
+        return std::string("/") + full_key.substr(mp_key.size());
+    }
+    S3FS_PRN_ERR("strip_mount_prefix: protocol violation — key '%s' does not "
+                 "start with mount_prefix '%s'. Skipping entry.",
+                 full_key.c_str(), mp_key.c_str());
+    return std::string();
+}
+
+//
 // Helper functions for object semantic mode
 //
 
@@ -426,11 +494,14 @@ static int rename_directory_s3(const char* from, const char* to)
     // Note: s3fs-fuse's rename_directory does not flush open files under the directory.
     // The flush-before-rename for individual files is handled at the top-level rename_file_s3.
 
-    // List all objects under the source directory (recursive, no delimiter)
+    // List all objects under the source directory (recursive, no delimiter).
+    // Inject mount_prefix so we list under the actual sub-path on the bucket,
+    // not bucket-root namesake. Returned keys still carry mount_prefix and
+    // must be converted back to FUSE-relative for mvnode book-keeping.
     // Reference: s3fs-fuse uses flat listing with pagination to get ALL descendants
-    std::string s3prefix = basepath.substr(1);  // strip leading '/' for S3 key prefix
+    std::string s3prefix = build_object_list_prefix(from);
     std::string base_query = "prefix=";
-    if(basepath != "/"){
+    if(!s3prefix.empty()){
         base_query += urlEncode(s3prefix) + "&";
     }
     base_query += "max-keys=1000&encoding-type=url";
@@ -538,7 +609,20 @@ static int rename_directory_s3(const char* from, const char* to)
                         // Detect directory markers by trailing '/'
                         bool is_dir = (!full_key.empty() && full_key.back() == '/');
 
-                        std::string from_name = "/" + full_key;
+                        // full_key carries mount_prefix (e.g.
+                        // "team_a/d1/foo.txt"); from_name must be
+                        // FUSE-relative so the downstream rename_object_s3 →
+                        // get_realpath chain re-adds mount_prefix exactly once.
+                        //
+                        // Empty return = protocol violation (key didn't start
+                        // with mount_prefix). Skip the entry rather than
+                        // fabricate a path that could collide with a real
+                        // object on Copy/Delete.
+                        std::string from_name = strip_mount_prefix_from_key(full_key);
+                        if(from_name.empty()){
+                            if(key_xp) xmlXPathFreeObject(key_xp);
+                            continue;
+                        }
                         std::string to_name = strto + full_key.substr(prefix_len);
 
                         mvnodes.push_back({from_name, to_name, is_dir});
@@ -938,7 +1022,15 @@ int s3fs_getattr_s3(const char* path, struct stat* stbuf)
     // ListBucket-style probing isn't appropriate there.
     if(result != 0 && g_bucket_type == BUCKET_TYPE_OBJECT_SEMANTIC){
         S3fsCurl probe_curl;
-        if(0 == probe_curl.CheckObjectBucketPrefixExists(path)){
+        // Under sub-path mount, path is FUSE-relative — must prepend
+        // mount_prefix before probing so we look under the actual sub-path,
+        // not bucket root. CheckObjectBucketPrefixExists itself just
+        // normalizes leading '/' and appends trailing '/' — it does NOT
+        // inject mount_prefix (the mount-time validator at
+        // hws_s3fs.cpp:3668 passes mount_prefix verbatim and must not be
+        // double-prefixed).
+        std::string probe_path = mount_prefix + path;
+        if(0 == probe_curl.CheckObjectBucketPrefixExists(probe_path)){
             S3FS_PRN_INFO("[path=%s] detected as implicit directory (ListBucket probe non-empty)", path);
             // Synthesize complete meta so the function-tail code produces
             // a sane stbuf for the kernel and the AddStat-in-cache path
@@ -1272,17 +1364,8 @@ static int directory_empty(const char* path)
         }
     }
 
-    // Build the prefix for listing
-    std::string prefix;
-    if(strcmp(path, "/") != 0) {
-        prefix = path;
-        if(!prefix.empty() && prefix[0] == '/') {
-            prefix = prefix.substr(1);
-        }
-        if(!prefix.empty() && prefix[prefix.length() - 1] != '/') {
-            prefix += "/";
-        }
-    }
+    // Build the prefix for listing (inject mount_prefix).
+    std::string prefix = build_object_list_prefix(path);
 
     // Build query string - max-keys=2: directory marker + at most 1 child
     std::string query;
@@ -2367,18 +2450,9 @@ int s3fs_readdir_s3(const char* path, void* buf, fuse_fill_dir_t filler, off_t o
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
 
-    // Build the prefix for listing
-    std::string prefix = "";
-    if(strcmp(path, "/") != 0) {
-        prefix = path;
-        // Remove leading slash and ensure trailing slash for directory listing
-        if(!prefix.empty() && prefix[0] == '/') {
-            prefix = prefix.substr(1);
-        }
-        if(!prefix.empty() && prefix[prefix.length() - 1] != '/') {
-            prefix += "/";
-        }
-    }
+    // Build the prefix for listing (inject mount_prefix so list operations
+    // stay scoped to the mounted sub-path, not bucket root).
+    std::string prefix = build_object_list_prefix(path);
 
     // Track all entries we've added from ListBucket to avoid duplicates
     std::set<std::string> listed_entries;
