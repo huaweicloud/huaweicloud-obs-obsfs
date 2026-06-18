@@ -625,6 +625,119 @@ TEST_F(S3fsOpsIncludeTest, GetNextMarker_MissingElement) {
 }
 
 // ==========================================================================
+// mount_prefix helpers: build_object_list_prefix / strip_mount_prefix_from_key
+// ==========================================================================
+//
+// mount_prefix is a global string defined in hws_s3fs.cpp; test_stubs.o
+// provides storage. We mutate it directly per test and restore on exit.
+extern std::string mount_prefix;
+
+class MountPrefixHelpersTest : public ::testing::Test {
+protected:
+    std::string saved_mp;
+    void SetUp() override {
+        g_bucket_type = BUCKET_TYPE_OBJECT_SEMANTIC;
+        saved_mp = mount_prefix;
+    }
+    void TearDown() override {
+        mount_prefix = saved_mp;
+        g_bucket_type = BUCKET_TYPE_UNKNOWN;
+    }
+};
+
+// --- build_object_list_prefix ---
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_RootMount_RootPath) {
+    mount_prefix = "";
+    EXPECT_EQ(std::string(""), build_object_list_prefix("/"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_RootMount_DirPath) {
+    mount_prefix = "";
+    EXPECT_EQ(std::string("foo/"), build_object_list_prefix("/foo"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_RootMount_NestedPath) {
+    mount_prefix = "";
+    EXPECT_EQ(std::string("foo/bar/"), build_object_list_prefix("/foo/bar"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_RootMount_PathAlreadyTrailingSlash) {
+    mount_prefix = "";
+    // Implementation accepts both "/foo" and "/foo/" — internal append-/
+    // is idempotent.
+    EXPECT_EQ(std::string("foo/"), build_object_list_prefix("/foo/"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_SubMount_RootPath) {
+    mount_prefix = "/team_a";
+    EXPECT_EQ(std::string("team_a/"), build_object_list_prefix("/"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_SubMount_DirPath) {
+    mount_prefix = "/team_a";
+    EXPECT_EQ(std::string("team_a/dir/"), build_object_list_prefix("/dir"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_NestedMount_NestedPath) {
+    mount_prefix = "/a/b/c";
+    EXPECT_EQ(std::string("a/b/c/x/y/"), build_object_list_prefix("/x/y"));
+}
+
+TEST_F(MountPrefixHelpersTest, BuildPrefix_SubMount_PathAlreadyTrailingSlash) {
+    mount_prefix = "/team_a";
+    EXPECT_EQ(std::string("team_a/dir/"), build_object_list_prefix("/dir/"));
+}
+
+// --- strip_mount_prefix_from_key ---
+
+TEST_F(MountPrefixHelpersTest, StripPrefix_RootMount_AnyKey) {
+    mount_prefix = "";
+    EXPECT_EQ(std::string("/foo"), strip_mount_prefix_from_key("foo"));
+    EXPECT_EQ(std::string("/foo/bar.txt"),
+              strip_mount_prefix_from_key("foo/bar.txt"));
+    EXPECT_EQ(std::string("/"), strip_mount_prefix_from_key(""));
+}
+
+TEST_F(MountPrefixHelpersTest, StripPrefix_SubMount_Match) {
+    mount_prefix = "/team_a";
+    EXPECT_EQ(std::string("/foo.txt"),
+              strip_mount_prefix_from_key("team_a/foo.txt"));
+    EXPECT_EQ(std::string("/dir/sub/leaf.txt"),
+              strip_mount_prefix_from_key("team_a/dir/sub/leaf.txt"));
+}
+
+TEST_F(MountPrefixHelpersTest, StripPrefix_SubMount_PrefixItself) {
+    mount_prefix = "/team_a";
+    // Key equals the mount_prefix marker — stripping leaves just "/"
+    EXPECT_EQ(std::string("/"), strip_mount_prefix_from_key("team_a/"));
+}
+
+TEST_F(MountPrefixHelpersTest, StripPrefix_SubMount_NoMatch_ReturnsEmpty) {
+    mount_prefix = "/team_a";
+    // Protocol violation: key doesn't start with mount_prefix.
+    // Contract: return empty so callers can skip.
+    EXPECT_EQ(std::string(""),
+              strip_mount_prefix_from_key("other_team/file.txt"));
+    EXPECT_EQ(std::string(""),
+              strip_mount_prefix_from_key("decoy_root.txt"));
+}
+
+TEST_F(MountPrefixHelpersTest, StripPrefix_SubMount_PartialMatch_NotPrefix) {
+    mount_prefix = "/team_a";
+    // "team_apple/..." starts with "team_a" textually but not with
+    // "team_a/" — must NOT match.
+    EXPECT_EQ(std::string(""),
+              strip_mount_prefix_from_key("team_apple/file.txt"));
+}
+
+TEST_F(MountPrefixHelpersTest, StripPrefix_NestedMount_Match) {
+    mount_prefix = "/a/b/c";
+    EXPECT_EQ(std::string("/x.txt"),
+              strip_mount_prefix_from_key("a/b/c/x.txt"));
+}
+
+// ==========================================================================
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
