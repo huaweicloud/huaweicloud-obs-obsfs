@@ -983,6 +983,8 @@ int s3fs_getattr_s3(const char* path, struct stat* stbuf)
     S3fsCurl s3fscurl;
     result = s3fscurl.HeadRequest(path, meta);
 
+    bool dir_hit_marker = false;
+
     // If failed, try with trailing slash (directory marker)
     if(result != 0 && (result == -ENOENT || result == -2)){
         std::string dir_path = path;
@@ -1000,6 +1002,7 @@ int s3fs_getattr_s3(const char* path, struct stat* stbuf)
         if(result2 == 0){
             // Success - this is a directory marker object
             S3FS_PRN_INFO("[path=%s] Found directory marker", path);
+            dir_hit_marker = true;
             meta = meta_tmp;
             result = 0;
         }
@@ -1100,6 +1103,10 @@ int s3fs_getattr_s3(const char* path, struct stat* stbuf)
     // Also check if path ends with / for directory marker objects
     size_t path_len = strlen(path);
     if(path_len > 1 && path[path_len - 1] == '/'){
+        is_directory = true;
+    }
+
+    if(dir_hit_marker){
         is_directory = true;
     }
 
